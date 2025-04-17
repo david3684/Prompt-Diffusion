@@ -1,4 +1,4 @@
-# Copyright 2024 Stability AI, The HuggingFace Team and InstantX Team. All rights reserved.
+# Copyright 2024 Stability AI, The HuggingFace Team and The InstantX Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,39 +12,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
-from diffusers.utils import USE_PEFT_BACKEND, BaseOutput, logging, scale_lora_layers, unscale_lora_layers, zero_module
-from diffusers.models.attention import JointTransformerBlock
-from diffusers.models.attention_processor import Attention, AttentionProcessor, FusedJointAttnProcessor2_0
-from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
-from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.transformers.transformer_sd3 import SD3SingleTransformerBlock
+from ...configuration_utils import ConfigMixin, register_to_config
+from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
+from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
+from ..attention import JointTransformerBlock
+from ..attention_processor import Attention, AttentionProcessor, FusedJointAttnProcessor2_0
+from ..embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
+from ..modeling_outputs import Transformer2DModelOutput
+from ..modeling_utils import ModelMixin
+from ..transformers.transformer_sd3 import SD3SingleTransformerBlock
+from .controlnet import BaseOutput, zero_module
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 @dataclass
-class PromptDiffusionDiTControlNetOutput(BaseOutput):
+class SD3ControlNetOutput(BaseOutput):
     controlnet_block_samples: Tuple[torch.Tensor]
 
 
-class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
-    """
-    PromptDiffusionControlNet model adapted for DiT (Diffusion Transformer) architecture from SD3.
-    
-    This class extends the SD3ControlNetModel to support the dual conditioning inputs of PromptDiffusion.
+class SD3ControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
+    r"""
+    ControlNet model for [Stable Diffusion 3](https://huggingface.co/papers/2403.03206).
 
     Parameters:
-        sample_size (`int`, defaults to `128`): 
-            The width/height of the latents.
+        sample_size (`int`, defaults to `128`):
+            The width/height of the latents. This is fixed during training since it is used to learn a number of
+            position embeddings.
         patch_size (`int`, defaults to `2`):
             Patch size to turn the input data into small patches.
         in_channels (`int`, defaults to `16`):
@@ -70,13 +72,14 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
         dual_attention_layers (`Tuple[int, ...]`, defaults to `()`):
             The number of dual-stream transformer blocks to use.
         qk_norm (`str`, *optional*, defaults to `None`):
-            The normalization to use for query and key in the attention layer.
+            The normalization to use for query and key in the attention layer. If `None`, no normalization is used.
         pos_embed_type (`str`, defaults to `"sincos"`):
-            The type of positional embedding to use.
+            The type of positional embedding to use. Choose between `"sincos"` and `None`.
         use_pos_embed (`bool`, defaults to `True`):
             Whether to use positional embeddings.
         force_zeros_for_pooled_projection (`bool`, defaults to `True`):
-            Whether to force zeros for pooled projection embeddings.
+            Whether to force zeros for pooled projection embeddings. This is handled in the pipelines by reading the
+            config value of the ControlNet model.
     """
 
     _supports_gradient_checkpointing = True
@@ -119,11 +122,9 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
             )
         else:
             self.pos_embed = None
-            
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.inner_dim, pooled_projection_dim=pooled_projection_dim
         )
-        
         if joint_attention_dim is not None:
             self.context_embedder = nn.Linear(joint_attention_dim, caption_projection_dim)
 
@@ -155,15 +156,13 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
                 ]
             )
 
-        # controlnet_blocks - standard controlnet processing blocks
+        # controlnet_blocks
         self.controlnet_blocks = nn.ModuleList([])
         for _ in range(len(self.transformer_blocks)):
             controlnet_block = nn.Linear(self.inner_dim, self.inner_dim)
             controlnet_block = zero_module(controlnet_block)
             self.controlnet_blocks.append(controlnet_block)
-            
-        # Primary condition embedding
-        cond_embed_input = PatchEmbed(
+        pos_embed_input = PatchEmbed(
             height=sample_size,
             width=sample_size,
             patch_size=patch_size,
@@ -171,23 +170,49 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
             embed_dim=self.inner_dim,
             pos_embed_type=None,
         )
-        self.cond_embed_input = zero_module(cond_embed_input)
-        
-        # Query condition embedding - PromptDiffusion specific
-        query_cond_embed_input = PatchEmbed(
-            height=sample_size,
-            width=sample_size,
-            patch_size=patch_size,
-            in_channels=in_channels + extra_conditioning_channels,
-            embed_dim=self.inner_dim, 
-            pos_embed_type=None,
-        )
-        self.query_cond_embed_input = zero_module(query_cond_embed_input)
+        self.pos_embed_input = zero_module(pos_embed_input)
 
         self.gradient_checkpointing = False
 
+    # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
+    def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
+        """
+        Sets the attention processor to use [feed forward
+        chunking](https://huggingface.co/blog/reformer#2-chunked-feed-forward-layers).
+
+        Parameters:
+            chunk_size (`int`, *optional*):
+                The chunk size of the feed-forward layers. If not specified, will run feed-forward layer individually
+                over each tensor of dim=`dim`.
+            dim (`int`, *optional*, defaults to `0`):
+                The dimension over which the feed-forward computation should be chunked. Choose between dim=0 (batch)
+                or dim=1 (sequence length).
+        """
+        if dim not in [0, 1]:
+            raise ValueError(f"Make sure to set `dim` to either 0 or 1, not {dim}")
+
+        # By default chunk size is 1
+        chunk_size = chunk_size or 1
+
+        def fn_recursive_feed_forward(module: torch.nn.Module, chunk_size: int, dim: int):
+            if hasattr(module, "set_chunk_feed_forward"):
+                module.set_chunk_feed_forward(chunk_size=chunk_size, dim=dim)
+
+            for child in module.children():
+                fn_recursive_feed_forward(child, chunk_size, dim)
+
+        for module in self.children():
+            fn_recursive_feed_forward(module, chunk_size, dim)
+
     @property
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors
     def attn_processors(self) -> Dict[str, AttentionProcessor]:
+        r"""
+        Returns:
+            `dict` of attention processors: A dictionary containing all attention processors used in the model with
+            indexed by its weight name.
+        """
+        # set recursively
         processors = {}
 
         def fn_recursive_add_processors(name: str, module: torch.nn.Module, processors: Dict[str, AttentionProcessor]):
@@ -204,7 +229,20 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
 
         return processors
 
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.set_attn_processor
     def set_attn_processor(self, processor: Union[AttentionProcessor, Dict[str, AttentionProcessor]]):
+        r"""
+        Sets the attention processor to use to compute attention.
+
+        Parameters:
+            processor (`dict` of `AttentionProcessor` or only `AttentionProcessor`):
+                The instantiated processor class or a dictionary of processor classes that will be set as the processor
+                for **all** `Attention` layers.
+
+                If `processor` is a dict, the key needs to define the path to the corresponding cross attention
+                processor. This is strongly recommended when setting trainable attention processors.
+
+        """
         count = len(self.attn_processors.keys())
 
         if isinstance(processor, dict) and len(processor) != count:
@@ -226,7 +264,18 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
         for name, module in self.named_children():
             fn_recursive_attn_processor(name, module, processor)
 
+    # Copied from diffusers.models.transformers.transformer_sd3.SD3Transformer2DModel.fuse_qkv_projections
     def fuse_qkv_projections(self):
+        """
+        Enables fused QKV projections. For self-attention modules, all projection matrices (i.e., query, key, value)
+        are fused. For cross-attention modules, key and value projection matrices are fused.
+
+        <Tip warning={true}>
+
+        This API is 🧪 experimental.
+
+        </Tip>
+        """
         self.original_attn_processors = None
 
         for _, attn_processor in self.attn_processors.items():
@@ -241,26 +290,33 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
 
         self.set_attn_processor(FusedJointAttnProcessor2_0())
 
+    # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.unfuse_qkv_projections
     def unfuse_qkv_projections(self):
+        """Disables the fused QKV projection if enabled.
+
+        <Tip warning={true}>
+
+        This API is 🧪 experimental.
+
+        </Tip>
+
+        """
         if self.original_attn_processors is not None:
             self.set_attn_processor(self.original_attn_processors)
-    
-    def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
-        if dim not in [0, 1]:
-            raise ValueError(f"Make sure to set `dim` to either 0 or 1, not {dim}")
 
-        # By default chunk size is 1
-        chunk_size = chunk_size or 1
-
-        def fn_recursive_feed_forward(module: torch.nn.Module, chunk_size: int, dim: int):
-            if hasattr(module, "set_chunk_feed_forward"):
-                module.set_chunk_feed_forward(chunk_size=chunk_size, dim=dim)
-
-            for child in module.children():
-                fn_recursive_feed_forward(child, chunk_size, dim)
-
-        for module in self.children():
-            fn_recursive_feed_forward(module, chunk_size, dim)
+    # Notes: This is for SD3.5 8b controlnet, which shares the pos_embed with the transformer
+    # we should have handled this in conversion script
+    def _get_pos_embed_from_transformer(self, transformer):
+        pos_embed = PatchEmbed(
+            height=transformer.config.sample_size,
+            width=transformer.config.sample_size,
+            patch_size=transformer.config.patch_size,
+            in_channels=transformer.config.in_channels,
+            embed_dim=transformer.inner_dim,
+            pos_embed_max_size=transformer.config.pos_embed_max_size,
+        )
+        pos_embed.load_state_dict(transformer.pos_embed.state_dict(), strict=True)
+        return pos_embed
 
     @classmethod
     def from_transformer(
@@ -277,8 +333,7 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
             controlnet.context_embedder.load_state_dict(transformer.context_embedder.state_dict())
             controlnet.transformer_blocks.load_state_dict(transformer.transformer_blocks.state_dict(), strict=False)
 
-            controlnet.cond_embed_input = zero_module(controlnet.cond_embed_input)
-            controlnet.query_cond_embed_input = zero_module(controlnet.query_cond_embed_input)
+            controlnet.pos_embed_input = zero_module(controlnet.pos_embed_input)
 
         return controlnet
 
@@ -286,40 +341,40 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
         self,
         hidden_states: torch.Tensor,
         controlnet_cond: torch.Tensor,
-        controlnet_query_cond: torch.Tensor,  # PromptDiffusion specific: query condition
         conditioning_scale: float = 1.0,
         encoder_hidden_states: torch.Tensor = None,
         pooled_projections: torch.Tensor = None,
         timestep: torch.LongTensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-    ) -> Union[torch.Tensor, PromptDiffusionDiTControlNetOutput]:
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
-        The forward method for PromptDiffusionDiTControlNetModel.
+        The [`SD3Transformer2DModel`] forward method.
 
         Args:
             hidden_states (`torch.Tensor` of shape `(batch size, channel, height, width)`):
                 Input `hidden_states`.
             controlnet_cond (`torch.Tensor`):
-                The primary conditional input tensor.
-            controlnet_query_cond (`torch.Tensor`):
-                The query conditional input tensor (PromptDiffusion specific).
+                The conditional input tensor of shape `(batch_size, sequence_length, hidden_size)`.
             conditioning_scale (`float`, defaults to `1.0`):
                 The scale factor for ControlNet outputs.
             encoder_hidden_states (`torch.Tensor` of shape `(batch size, sequence_len, embed_dims)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-            pooled_projections (`torch.Tensor` of shape `(batch_size, projection_dim)`): 
-                Embeddings projected from the embeddings of input conditions.
-            timestep (`torch.LongTensor`):
+            pooled_projections (`torch.Tensor` of shape `(batch_size, projection_dim)`): Embeddings projected
+                from the embeddings of input conditions.
+            timestep ( `torch.LongTensor`):
                 Used to indicate denoising step.
             joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor`.
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a `PromptDiffusionDiTControlNetOutput` instead of a plain tuple.
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
 
         Returns:
-            If `return_dict` is True, a `PromptDiffusionDiTControlNetOutput` is returned, otherwise a
-            `tuple` where the first element contains the controlnet block samples.
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
         """
         if joint_attention_kwargs is not None:
             joint_attention_kwargs = joint_attention_kwargs.copy()
@@ -328,28 +383,38 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
             lora_scale = 1.0
 
         if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
+        else:
+            if joint_attention_kwargs is not None and joint_attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+                )
 
         if self.pos_embed is not None and hidden_states.ndim != 4:
             raise ValueError("hidden_states must be 4D when pos_embed is used")
+
+        # SD3.5 8b controlnet does not have a `pos_embed`,
+        # it use the `pos_embed` from the transformer to process input before passing to controlnet
         elif self.pos_embed is None and hidden_states.ndim != 3:
             raise ValueError("hidden_states must be 3D when pos_embed is not used")
 
         if self.context_embedder is not None and encoder_hidden_states is None:
             raise ValueError("encoder_hidden_states must be provided when context_embedder is used")
+        # SD3.5 8b controlnet does not have a `context_embedder`, it does not use `encoder_hidden_states`
         elif self.context_embedder is None and encoder_hidden_states is not None:
             raise ValueError("encoder_hidden_states should not be provided when context_embedder is not used")
 
         if self.pos_embed is not None:
-            hidden_states = self.pos_embed(hidden_states)
+            hidden_states = self.pos_embed(hidden_states)  # takes care of adding positional embeddings too.
 
         temb = self.time_text_embed(timestep, pooled_projections)
 
         if self.context_embedder is not None:
             encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        # Add primary and query conditions - PromptDiffusion specific
-        hidden_states = hidden_states + self.cond_embed_input(controlnet_cond) + self.query_cond_embed_input(controlnet_query_cond)
+        # add
+        hidden_states = hidden_states + self.pos_embed_input(controlnet_cond)
 
         block_res_samples = ()
 
@@ -363,13 +428,16 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
                         temb,
                     )
                 else:
+                    # SD3.5 8b controlnet use single transformer block, which does not use `encoder_hidden_states`
                     hidden_states = self._gradient_checkpointing_func(block, hidden_states, temb)
+
             else:
                 if self.context_embedder is not None:
                     encoder_hidden_states, hidden_states = block(
                         hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
                     )
                 else:
+                    # SD3.5 8b controlnet use single transformer block, which does not use `encoder_hidden_states`
                     hidden_states = block(hidden_states, temb)
 
             block_res_samples = block_res_samples + (hidden_states,)
@@ -379,29 +447,30 @@ class PromptDiffusionDiTControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixi
             block_res_sample = controlnet_block(block_res_sample)
             controlnet_block_res_samples = controlnet_block_res_samples + (block_res_sample,)
 
-        # Apply conditioning scale
+        # 6. scaling
         controlnet_block_res_samples = [sample * conditioning_scale for sample in controlnet_block_res_samples]
 
         if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
             return (controlnet_block_res_samples,)
 
-        return PromptDiffusionDiTControlNetOutput(controlnet_block_samples=controlnet_block_res_samples)
+        return SD3ControlNetOutput(controlnet_block_samples=controlnet_block_res_samples)
 
 
-class PromptDiffusionMultiDiTControlNetModel(ModelMixin):
-    """
-    PromptDiffusionDiTControlNetModel wrapper class for Multi-PromptDiffusionDiTControlNet.
+class SD3MultiControlNetModel(ModelMixin):
+    r"""
+    `SD3ControlNetModel` wrapper class for Multi-SD3ControlNet
 
-    This module is a wrapper for multiple instances of the PromptDiffusionDiTControlNetModel.
-    The forward() API is designed to be compatible with PromptDiffusionDiTControlNetModel.
+    This module is a wrapper for multiple instances of the `SD3ControlNetModel`. The `forward()` API is designed to be
+    compatible with `SD3ControlNetModel`.
 
     Args:
-        controlnets (List[PromptDiffusionDiTControlNetModel]):
-            Provides additional conditioning to the transformer during the denoising process.
-            You must set multiple PromptDiffusionDiTControlNetModel as a list.
+        controlnets (`List[SD3ControlNetModel]`):
+            Provides additional conditioning to the unet during the denoising process. You must set multiple
+            `SD3ControlNetModel` as a list.
     """
 
     def __init__(self, controlnets):
@@ -412,28 +481,26 @@ class PromptDiffusionMultiDiTControlNetModel(ModelMixin):
         self,
         hidden_states: torch.Tensor,
         controlnet_cond: List[torch.tensor],
-        controlnet_query_cond: List[torch.tensor],  # PromptDiffusion specific
         conditioning_scale: List[float],
         pooled_projections: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         timestep: torch.LongTensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-    ) -> Union[PromptDiffusionDiTControlNetOutput, Tuple]:
-        for i, (cond, query_cond, scale, controlnet) in enumerate(zip(controlnet_cond, controlnet_query_cond, conditioning_scale, self.nets)):
+    ) -> Union[SD3ControlNetOutput, Tuple]:
+        for i, (image, scale, controlnet) in enumerate(zip(controlnet_cond, conditioning_scale, self.nets)):
             block_samples = controlnet(
                 hidden_states=hidden_states,
                 timestep=timestep,
                 encoder_hidden_states=encoder_hidden_states,
                 pooled_projections=pooled_projections,
-                controlnet_cond=cond,
-                controlnet_query_cond=query_cond,
+                controlnet_cond=image,
                 conditioning_scale=scale,
                 joint_attention_kwargs=joint_attention_kwargs,
                 return_dict=return_dict,
             )
 
-            # Merge samples
+            # merge samples
             if i == 0:
                 control_block_samples = block_samples
             else:
