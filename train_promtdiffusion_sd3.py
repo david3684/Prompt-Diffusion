@@ -1213,12 +1213,12 @@ def main(args):
         train_tasks=args.control_type, 
         test_tasks=[], 
         task_per_batch=args.task_per_batch,
-        splits=(0.9, 0.1)
+        splits=(0.9, 0.1),
         res=args.resolution,
         shots=1,
-        total_samples=args.max_train_samples if args.max_train_samples else 300000  
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        total_samples=args.max_train_samples if args.max_train_samples else 300000  
     )
     data_module.setup()
 
@@ -1359,16 +1359,26 @@ def main(args):
                 # Convert images to latent space
                 
                 batch = process_batch_with_embeds(batch)
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
-                model_input = vae.encode(pixel_values).latent_dist.sample()
+
+                # 1) query vs support 분리
+                # pixel_values: [B, 2, C, H, W]
+                # conditioning_pixel_values: [B, T, 2, C, H, W]
+                imgs         = batch["pixel_values"]                 # [B,2,C,H,W]
+                conds        = batch["conditioning_pixel_values"]    # [B,T,2,C,H,W]
+                query_imgs   = imgs[:, 0]                            # [B,C,H,W]
+                support_imgs = imgs[:, 1]                            # [B,C,H,W]
+                query_conds  = conds[:, :, 0]                        # [B,T,C,H,W]
+                support_conds= conds[:, :, 1]                        # [B,T,C,H,W]
+                
+                
+                # 2) query image → VAE encode → latent
+                model_input = vae.encode(query_imgs.to(dtype=vae.dtype)).latent_dist.sample()  # [B,C',H',W'] 
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                # Sample noise that we'll add to the latents
+                # 3) flow-matching noise & timestep
                 noise = torch.randn_like(model_input)
-                bsz = model_input.shape[0]
-                # Sample a random timestep for each image
-                # for weighting schemes where we sample timesteps non-uniformly
+                bsz   = model_input.shape[0]
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme=args.weighting_scheme,
                     batch_size=bsz,
@@ -1376,30 +1386,37 @@ def main(args):
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
                 )
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                indices   = (u * noise_scheduler_copy.config.num_train_timesteps).long()
                 timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
-
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                sigmas    = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
-                # Get the text embedding for conditioning
-                prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
+                # 4) 텍스트 임베딩
+                prompt_embeds        = batch["prompt_embeds"].to(dtype=weight_dtype)
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
 
-                # controlnet(s) inference
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
-                controlnet_image = controlnet_image * vae.config.scaling_factor
+                with torch.no_grad():
+                    B, T, Cc, Hc, Wc = support_conds.shape # [B*T, C, H, W]
+                    qc_flat     = query_conds.reshape(B * T, Cc, Hc, Wc)           # [B*T, C, H, W]
+                    qc_latent   = vae.encode(qc_flat.to(dtype=vae.dtype)).latent_dist.sample()
+                    qc_latent   = qc_latent * vae.config.scaling_factor           # [B*T, C', H', W']
+                    qc_latent   = qc_latent.to(dtype=weight_dtype) # query condition
+                    
+                    sc_flat = support_conds.reshape(B * T, Cc, Hc, Wc) # [B*T, C, H, W]
+                    sg_flat = support_imgs.unsqueeze(1).expand(B, T, Cc, Hc, Wc).reshape(B * T, Cc, Hc, Wc) # [B*T, 2*C, H, W]
+                    sp_pair = torch.cat([sc_flat, sg_flat], dim=1) # prompt diffusion (support condition + support image)
+
+                    support_pair_latent = vae.encode(sp_pair.to(dtype=vae.dtype)).latent_dist.sample()
+                    support_pair_latent = support_pair_latent * vae.config.scaling_factor
+                    support_pair_latent = support_pair_latent.to(dtype=weight_dtype)
 
                 control_block_res_samples = controlnet(
-                    hidden_states=noisy_model_input,
-                    timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    controlnet_cond=controlnet_image,
-                    controlnet_example_pair_cond=controlnet_image_example_pair,
+                    hidden_states                 = noisy_model_input,               # query noisy latent
+                    timestep                      = timesteps,
+                    encoder_hidden_states         = prompt_embeds,
+                    pooled_projections            = pooled_prompt_embeds,
+                    controlnet_cond               = qc_latent,               # query conditioning
+                    controlnet_example_pair_cond  = support_pair_latent,           # support conditioning
                     return_dict=False,
                 )[0]
                 control_block_res_samples = [sample.to(dtype=weight_dtype) for sample in control_block_res_samples]
