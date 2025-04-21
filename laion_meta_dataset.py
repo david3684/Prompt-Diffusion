@@ -62,9 +62,14 @@ class LaionBaseDataset(Dataset):
         self.num_filegroups = len(self.filenames) // self.shots
 
         if not shuffle:
+            # deterministic grouping
             self.filegroups = [
-                self.filenames[i : i + self.shots] for i in range(0, len(self.filenames), self.shots)
+                self.filenames[i : i + self.shots]
+                for i in range(0, len(self.filenames), self.shots)
             ]
+        else:
+            # initialize filegroups for the shuffle case
+            self.create_filegroups()
 
     def create_filegroups(self):
         # Shuffle filenames each time you want new filegroups
@@ -91,8 +96,8 @@ class LaionBaseDataset(Dataset):
 
         files = self.filegroups[i] + self.filegroups[sp_idx]
 
-        # load images
-        images = [torch.tensor(np.array(Image.open(file).convert('RGB'))).float() / 255. # Process by VAE
+        # load images and normalize to 0~1
+        images = [torch.tensor(np.array(Image.open(file).convert('RGB'))).float() / 255.  # 0~1 범위로 정규화
                     for file in files]
         images = [rearrange(image, 'h w c -> c h w') for image in images] # [2*shots, c, h, w]
         images = torch.stack(images) # [2*shots, c, h, w]
@@ -105,13 +110,13 @@ class LaionBaseDataset(Dataset):
             tasks = self.tasks
         task_indices = torch.tensor([TASKS[t] for t in tasks]) # [T]
 
-        # load conditions
+        # load conditions - keep these normalized to 0~1
         labels = []
         for task in tasks:
             task_labels = []
             for file in files:
                 dir, name = file.split('/')[-2:]
-                task_labels.append(torch.tensor(np.array(Image.open(f"{self.path}/{dir}/{task}/{name}").convert('RGB'))).float())
+                task_labels.append(torch.tensor(np.array(Image.open(f"{self.path}/{dir}/{task}/{name}").convert('RGB'))).float() / 255.)
             task_labels = [rearrange(label, 'h w c -> c h w') for label in task_labels]
             task_labels = torch.stack(task_labels) # [2*shots, c, h, w]
             labels.append(task_labels)
@@ -222,8 +227,8 @@ class ControlDataModule(L.LightningDataModule):
             torch.arange(total_samples), self.splits, generator=generator
         )
         train_tasks = self.train_tasks.copy()
-        train_tasks.remove('pose')
-        train_tasks.remove('densepose')
+        # train_tasks.remove('pose')
+        # train_tasks.remove('densepose')
         train_normal_ds = LaionBaseDataset(
             path=self.path,
             tasks=train_tasks,

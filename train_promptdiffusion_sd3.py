@@ -41,10 +41,10 @@ from PIL import Image
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
 # 기존 import 구문 아래에 추가
-from dataset import ControlDataModule
+from laion_meta_dataset import ControlDataModule
 import diffusers
 from promptdiffusioncontrolnetpipeline_sd3 import SD3PromptDiffusionPipeLine
-from promptdiffusioncontrolnet_sd3 import SD3PromptDiffusionControlNet
+from promptdiffusioncontrolnet_sd3 import SD3PromptDiffusionModel
 from diffusers import (
     AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
@@ -57,7 +57,7 @@ from diffusers.utils import check_min_version, is_wandb_available, make_image_gr
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.testing_utils import backend_empty_cache
 from diffusers.utils.torch_utils import is_compiled_module
-
+import torch.nn as nn
 
 if is_wandb_available():
     import wandb
@@ -66,8 +66,7 @@ if is_wandb_available():
 check_min_version("0.33.0.dev0")
 
 logger = get_logger(__name__)
-
-
+    
 def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
 
@@ -77,7 +76,7 @@ def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_v
     if not is_final_validation:
         controlnet = accelerator.unwrap_model(controlnet)
     else:
-        controlnet = SD3PromptDiffusionControlNet.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+        controlnet = SD3PromptDiffusionModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
 
     pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -364,6 +363,12 @@ def parse_args(input_args=None):
         "--max_train_steps",
         type=int,
         default=None,
+        help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
+    )
+    parser.add_argument(
+        "--tasks_per_batch",
+        type=int,
+        default=2,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -654,12 +659,6 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    # if args.dataset_name is None and args.train_data_dir is None:
-    #     raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
-
-    # if args.dataset_name is not None and args.train_data_dir is not None:
-    #     raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
-
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
@@ -687,138 +686,6 @@ def parse_args(input_args=None):
         )
 
     return args
-
-
-# def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, accelerator):
-#     # Get the datasets: you can either provide your own training and evaluation files (see below)
-#     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-#     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-#     # download the dataset.
-#     if args.dataset_name is not None:
-#         # Downloading and loading a dataset from the hub.
-#         dataset = load_dataset(
-#             args.dataset_name,
-#             args.dataset_config_name,
-#             cache_dir=args.cache_dir,
-#         )
-#     else:
-#         if args.train_data_dir is not None:
-#             dataset = load_dataset(
-#                 args.train_data_dir,
-#                 cache_dir=args.cache_dir,
-#                 trust_remote_code=True,
-#             )
-#         # See more about loading custom images at
-#         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-
-#     # Preprocessing the datasets.
-#     # We need to tokenize inputs and targets.
-#     column_names = dataset["train"].column_names
-
-#     # 6. Get the column names for input/target.
-#     if args.image_column is None:
-#         image_column = column_names[0]
-#         logger.info(f"image column defaulting to {image_column}")
-#     else:
-#         image_column = args.image_column
-#         if image_column not in column_names:
-#             raise ValueError(
-#                 f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     if args.caption_column is None:
-#         caption_column = column_names[1]
-#         logger.info(f"caption column defaulting to {caption_column}")
-#     else:
-#         caption_column = args.caption_column
-#         if caption_column not in column_names:
-#             raise ValueError(
-#                 f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     if args.conditioning_image_column is None:
-#         conditioning_image_column = column_names[2]
-#         logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
-#     else:
-#         conditioning_image_column = args.conditioning_image_column
-#         if conditioning_image_column not in column_names:
-#             raise ValueError(
-#                 f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-#             )
-
-#     def process_captions(examples, is_train=True):
-#         captions = []
-#         for caption in examples[caption_column]:
-#             if random.random() < args.proportion_empty_prompts:
-#                 captions.append("")
-#             elif isinstance(caption, str):
-#                 captions.append(caption)
-#             elif isinstance(caption, (list, np.ndarray)):
-#                 # take a random caption if there are multiple
-#                 captions.append(random.choice(caption) if is_train else caption[0])
-#             else:
-#                 raise ValueError(
-#                     f"Caption column `{caption_column}` should contain either strings or lists of strings."
-#                 )
-#         return captions
-
-#     image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#             transforms.Normalize([0.5], [0.5]),
-#         ]
-#     )
-
-#     conditioning_image_transforms = transforms.Compose(
-#         [
-#             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-#             transforms.CenterCrop(args.resolution),
-#             transforms.ToTensor(),
-#         ]
-#     )
-
-#     def preprocess_train(examples):
-#         images = [image.convert("RGB") for image in examples[image_column]]
-#         images = [image_transforms(image) for image in images]
-
-#         conditioning_images = [image.convert("RGB") for image in examples[conditioning_image_column]]
-#         conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-
-#         examples["pixel_values"] = images
-#         examples["conditioning_pixel_values"] = conditioning_images
-#         examples["prompts"] = process_captions(examples)
-
-#         return examples
-
-#     with accelerator.main_process_first():
-#         if args.max_train_samples is not None:
-#             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-#         # Set the training transforms
-#         train_dataset = dataset["train"].with_transform(preprocess_train)
-
-#     return train_dataset
-
-
-# def collate_fn(examples):
-#     pixel_values = torch.stack([example["pixel_values"] for example in examples])
-#     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-#     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-#     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
-#     prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-#     pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
-
-#     return {
-#         "pixel_values": pixel_values,
-#         "conditioning_pixel_values": conditioning_pixel_values,
-#         "prompt_embeds": prompt_embeds,
-#         "pooled_prompt_embeds": pooled_prompt_embeds,
-#     }
-
 
 # Copied from dreambooth sd3 example
 def _encode_prompt_with_t5(
@@ -1033,7 +900,7 @@ def main(args):
     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
         text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
     )
-    vae = AutoencoderKL.from_pretrained(
+    orig_vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
@@ -1045,15 +912,16 @@ def main(args):
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
-        controlnet = SD3PromptDiffusionControlNet.from_pretrained(args.controlnet_model_name_or_path)
+        controlnet = SD3PromptDiffusionModel.from_pretrained(args.controlnet_model_name_or_path)
     else:
         logger.info("Initializing controlnet weights from transformer")
-        controlnet = SD3PromptDiffusionControlNet.from_transformer(
+        controlnet = SD3PromptDiffusionModel.from_transformer(
             transformer, num_extra_conditioning_channels=args.num_extra_conditioning_channels
         )
 
     transformer.requires_grad_(False)
-    vae.requires_grad_(False)
+    orig_vae.requires_grad_(False)
+    
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
@@ -1087,7 +955,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = SD3PromptDiffusionControlNet.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = SD3PromptDiffusionModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -1153,66 +1021,20 @@ def main(args):
 
     # Move vae, transformer and text_encoder to device and cast to weight_dtype
     if args.upcast_vae:
-        vae.to(accelerator.device, dtype=torch.float32)
+        orig_vae.to(accelerator.device, dtype=torch.float32)
     else:
-        vae.to(accelerator.device, dtype=weight_dtype)
+        orig_vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
-    # train_dataset = make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, accelerator)
-
-    # tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
-    # text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
-
-    # def compute_text_embeddings(batch, text_encoders, tokenizers):
-    #     with torch.no_grad():
-    #         prompt = batch["prompts"]
-    #         prompt_embeds, pooled_prompt_embeds = encode_prompt(
-    #             text_encoders, tokenizers, prompt, args.max_sequence_length
-    #         )
-    #         prompt_embeds = prompt_embeds.to(accelerator.device)
-    #         pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
-    #     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
-
-    # compute_embeddings_fn = functools.partial(
-    #     compute_text_embeddings,
-    #     text_encoders=text_encoders,
-    #     tokenizers=tokenizers,
-    # )
-    # with accelerator.main_process_first():
-    #     from datasets.fingerprint import Hasher
-
-    #     # fingerprint used by the cache for the other processes to load the result
-    #     # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-    #     new_fingerprint = Hasher.hash(args)
-    #     train_dataset = train_dataset.map(
-    #         compute_embeddings_fn,
-    #         batched=True,
-    #         batch_size=args.dataset_preprocess_batch_size,
-    #         new_fingerprint=new_fingerprint,
-    #     )
-
-    # del text_encoder_one, text_encoder_two, text_encoder_three
-    # del tokenizer_one, tokenizer_two, tokenizer_three
-    # free_memory()
-
-    # train_dataloader = torch.utils.data.DataLoader(
-    #     train_dataset,
-    #     shuffle=True,
-    #     collate_fn=collate_fn,
-    #     batch_size=args.train_batch_size,
-    #     num_workers=args.dataloader_num_workers,
-    # )
-
-    # ControlDataModule 초기화
     data_module = ControlDataModule(
-        path="/data2/david3684/sd3control_base/datasets/laion_data/laion_nonhuman",  # 경로는 args.train_data_dir 사용
-        human_path="/data2/david3684/sd3control_base/datasets/laion_data/laion_human",
-        train_tasks=args.control_type, 
+        path="/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman",  # 경로는 args.train_data_dir 사용
+        human_path="/data2/david3684/ufg_diff/datasets/laion_data/laion_human",
+        train_tasks=['canny', 'depth', 'hed', 'normal'], 
         test_tasks=[], 
-        task_per_batch=args.task_per_batch,
+        tasks_per_batch=1,
         splits=(0.9, 0.1),
         res=args.resolution,
         shots=1,
@@ -1232,7 +1054,7 @@ def main(args):
     # 텍스트 임베딩 계산을 위한 함수 - collate_fn 대신 사용
     def process_batch_with_embeds(batch):
         with torch.no_grad():
-            prompts = batch["prompts"]
+            prompts = batch["prompts"][0]
             prompt_embeds, pooled_prompt_embeds = encode_prompt(
                 text_encoders, tokenizers, prompts, args.max_sequence_length
             )
@@ -1273,7 +1095,6 @@ def main(args):
     controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         controlnet, optimizer, train_dataloader, lr_scheduler
     )
-
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1372,43 +1193,66 @@ def main(args):
                 
                 
                 # 2) query image → VAE encode → latent
-                model_input = vae.encode(query_imgs.to(dtype=vae.dtype)).latent_dist.sample()  # [B,C',H',W'] 
-                model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
+                model_input = orig_vae.encode(query_imgs.to(dtype=orig_vae.dtype)).latent_dist.sample()  # [B,C',H',W'] 
+                model_input = (model_input - orig_vae.config.shift_factor) * orig_vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
                 # 3) flow-matching noise & timestep
                 noise = torch.randn_like(model_input)
-                bsz   = model_input.shape[0]
+                B = imgs.shape[0]
+                T = conds.shape[1]
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme=args.weighting_scheme,
-                    batch_size=bsz,
+                    batch_size=B,
                     logit_mean=args.logit_mean,
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
                 )
                 indices   = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)  # [B]
                 sigmas    = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                noisy    = (1.0 - sigmas) * model_input + sigmas * noise                        # [B, C', H', W']
+                noisy = noisy.unsqueeze(1).repeat(1, T, 1, 1, 1)                                    # [B, T, C', H', W']
+                noisy_model_input = noisy.reshape(B * T, noisy.shape[2], noisy.shape[3], noisy.shape[4])  # [B*T, C', H', W']
+
+                timesteps = timesteps.unsqueeze(1).repeat(1, T).reshape(B * T)                     # [B*T]
 
                 # 4) 텍스트 임베딩
                 prompt_embeds        = batch["prompt_embeds"].to(dtype=weight_dtype)
+                prompt_embeds = (
+                    prompt_embeds
+                    .unsqueeze(1)        # [B,1,seq_len,D]
+                    .expand(-1, T, -1, -1)  # [B,T,seq_len,D]
+                    .reshape(B * T, prompt_embeds.shape[-2], prompt_embeds.shape[-1])
+                )
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
+                pooled_prompt_embeds = (
+                    pooled_prompt_embeds
+                    .unsqueeze(1)       # [B,1,D]
+                    .expand(-1, T, -1)  # [B,T,D]
+                    .reshape(B * T, pooled_prompt_embeds.shape[-1])
+                )
 
                 with torch.no_grad():
-                    B, T, Cc, Hc, Wc = support_conds.shape # [B*T, C, H, W]
+                    Cc, Hc, Wc = query_conds.shape[2], query_conds.shape[3], query_conds.shape[4]
                     qc_flat     = query_conds.reshape(B * T, Cc, Hc, Wc)           # [B*T, C, H, W]
-                    qc_latent   = vae.encode(qc_flat.to(dtype=vae.dtype)).latent_dist.sample()
-                    qc_latent   = qc_latent * vae.config.scaling_factor           # [B*T, C', H', W']
+                    qc_latent   = orig_vae.encode(qc_flat.to(dtype=orig_vae.dtype)).latent_dist.sample()
+                    qc_latent   = (qc_latent-orig_vae.config.shift_factor) * orig_vae.config.scaling_factor           # [B*T, C', H', W']
                     qc_latent   = qc_latent.to(dtype=weight_dtype) # query condition
                     
                     sc_flat = support_conds.reshape(B * T, Cc, Hc, Wc) # [B*T, C, H, W]
-                    sg_flat = support_imgs.unsqueeze(1).expand(B, T, Cc, Hc, Wc).reshape(B * T, Cc, Hc, Wc) # [B*T, 2*C, H, W]
-                    sp_pair = torch.cat([sc_flat, sg_flat], dim=1) # prompt diffusion (support condition + support image)
+                    sg_flat = support_imgs.unsqueeze(1).expand(B, T, Cc, Hc, Wc).reshape(B * T, Cc, Hc, Wc) # [B*T, C, H, W]
 
-                    support_pair_latent = vae.encode(sp_pair.to(dtype=vae.dtype)).latent_dist.sample()
-                    support_pair_latent = support_pair_latent * vae.config.scaling_factor
-                    support_pair_latent = support_pair_latent.to(dtype=weight_dtype)
+                    unwrapped_controlnet = unwrap_model(controlnet)
+                    support_latent_dist = unwrapped_controlnet.encode_support_pair(
+                        sc_flat.to(dtype=orig_vae.dtype),
+                        sg_flat.to(dtype=orig_vae.dtype),
+                        vae=orig_vae,
+                    )
+                    
+                    support_pair_latent = (support_latent_dist - orig_vae.config.shift_factor) * orig_vae.config.scaling_factor
+                    support_pair_latent = support_latent_dist.to(dtype=weight_dtype)
+
 
                 control_block_res_samples = controlnet(
                     hidden_states                 = noisy_model_input,               # query noisy latent
@@ -1431,6 +1275,10 @@ def main(args):
                     return_dict=False,
                 )[0]
 
+                sigmas = sigmas.unsqueeze(1)                    # [B, 1, 1, 1, 1]
+                sigmas = sigmas.expand(-1, T, -1, -1, -1)       # [B, T, 1, 1, 1]
+                sigmas = sigmas.reshape(B * T, 1, 1, 1)         # [B*T, 1, 1, 1]
+                # Preconditioning of the model inputs.  
                 # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
                 # Preconditioning of the model outputs.
                 if args.precondition_outputs:
@@ -1442,13 +1290,17 @@ def main(args):
 
                 # flow matching loss
                 if args.precondition_outputs:
-                    target = model_input
+                    target = model_input  # [B, C', H', W']
+                    # 형태 맞추기: [B, C', H', W'] -> [B*T, C', H', W']
+                    target = target.unsqueeze(1).repeat(1, T, 1, 1, 1).reshape(B * T, target.shape[1], target.shape[2], target.shape[3])
                 else:
-                    target = noise - model_input
+                    target = noise - model_input  # [B, C', H', W']
+                    # 형태 맞추기: [B, C', H', W'] -> [B*T, C', H', W']
+                    target = target.unsqueeze(1).repeat(1, T, 1, 1, 1).reshape(B * T, target.shape[1], target.shape[2], target.shape[3])
 
                 # Compute regular loss.
                 loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(model_pred.shape[0], -1),
                     1,
                 )
                 loss = loss.mean()

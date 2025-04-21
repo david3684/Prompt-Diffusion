@@ -15,7 +15,8 @@
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import torch
+import torch, PIL
+import numpy as np
 from transformers import (
     CLIPTextModelWithProjection,
     CLIPTokenizer,
@@ -25,13 +26,13 @@ from transformers import (
     T5TokenizerFast,
 )
 
-from ...image_processor import PipelineImageInput, VaeImageProcessor
-from ...loaders import FromSingleFileMixin, SD3IPAdapterMixin, SD3LoraLoaderMixin
-from ...models.autoencoders import AutoencoderKL
+from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
+from diffusers.loaders import FromSingleFileMixin, SD3IPAdapterMixin, SD3LoraLoaderMixin
+from diffusers.models.autoencoders import AutoencoderKL
 from promptdiffusioncontrolnet_sd3 import SD3PromptDiffusionModel
-from ...models.transformers import SD3Transformer2DModel
-from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import (
+from diffusers.models.transformers import SD3Transformer2DModel
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from diffusers.utils import (
     USE_PEFT_BACKEND,
     is_torch_xla_available,
     logging,
@@ -39,17 +40,13 @@ from ...utils import (
     scale_lora_layers,
     unscale_lora_layers,
 )
-from ...utils.torch_utils import randn_tensor
-from ..pipeline_utils import DiffusionPipeline
-from ..stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.pipelines.stable_diffusion_3.pipeline_output import StableDiffusion3PipelineOutput
 
 
-if is_torch_xla_available():
-    import torch_xla.core.xla_model as xm
 
-    XLA_AVAILABLE = True
-else:
-    XLA_AVAILABLE = False
+XLA_AVAILABLE = False
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -805,6 +802,54 @@ class SD3PromptDiffusionPipeLine(
 
         super().enable_sequential_cpu_offload(*args, **kwargs)
 
+    def postprocess(
+        self,
+        image: torch.Tensor,
+        output_type: str = "pil",
+        do_denormalize: Optional[List[bool]] = None,
+    ) -> Union[PIL.Image.Image, np.ndarray, torch.Tensor]:
+        """
+        0~1 범위로 정규화된 이미지에 맞게 후처리를 수행하는 함수입니다.
+        기존 denormalize 함수는 -1~1 범위를 가정하고 (images * 0.5 + 0.5)를 적용하지만,
+        우리는 이미지가 이미 0~1 범위로 정규화되었으므로 그냥 clamp만 적용합니다.
+
+        Args:
+            image (`torch.Tensor`):
+                후처리할 이미지 텐서, 형태는 `B x C x H x W`.
+            output_type (`str`, *optional*, defaults to `pil`):
+                출력 이미지 형식 (`pil`, `np`, `pt`, `latent` 중 하나).
+            do_denormalize (`List[bool]`, *optional*, defaults to `None`):
+                이미지를 [0,1] 범위로 변환할지 여부. 기본적으로는 변환하지 않습니다 (이미 0~1 범위임).
+
+        Returns:
+            `PIL.Image.Image`, `np.ndarray` 또는 `torch.Tensor`:
+                후처리된 이미지.
+        """
+        if not isinstance(image, torch.Tensor):
+            raise ValueError(
+                f"입력 이미지 형식이 잘못되었습니다: {type(image)}. PyTorch 텐서만 지원합니다."
+            )
+            
+        if output_type not in ["latent", "pt", "np", "pil"]:
+            output_type = "np"
+
+        if output_type == "latent":
+            return image
+
+        # 이미 0~1 범위이므로 denormalize 없이 clamp만 적용
+        image = image.clamp(0, 1)
+
+        if output_type == "pt":
+            return image
+
+        image = self.image_processor.pt_to_numpy(image)
+
+        if output_type == "np":
+            return image
+
+        if output_type == "pil":
+            return self.image_processor.numpy_to_pil(image)
+            
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -1064,12 +1109,9 @@ class SD3PromptDiffusionPipeLine(
                 ) 
                 for each_image in control_image_pair
             ]
-            
-            # 채널 차원(dim=1)에서 이미지 쌍을 concat
-            image_pair = torch.cat(processed_images, dim=1)
-            
-            # VAE로 인코딩
-            control_image_pair = self.vae.encode(image_pair).latent_dist.sample()
+            # supportPair 인코딩 후 shift_factor를 빼고 scaling_factor를 곱하는 방식으로 수정
+            # 훈련 코드와 일치시킴
+            control_image_pair = self.controlnet.encode_support_pair(processed_images[0], processed_images[1], vae=self.vae)
             control_image_pair = (control_image_pair - vae_shift_factor) * self.vae.config.scaling_factor
 
         # 3. Prepare control image
@@ -1229,7 +1271,9 @@ class SD3PromptDiffusionPipeLine(
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            print(image.min().item(), image.max().item())
+            print(image)
+            image = self.postprocess(image, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()

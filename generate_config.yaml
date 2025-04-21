@@ -1,0 +1,38 @@
+dtype: "bfloat16"
+
+model:
+  control_interval: 2
+
+  matching:
+    dim_q: 768
+    dim_k: 768
+    dim_v: 1536
+    head: 12
+    hidden_dim: 768
+    n_tasks: 8
+
+data:
+  path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman"
+  human_path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_human"
+  train_tasks: ['canny', 'depth', 'hed', 'normal']
+  test_tasks: [] # "sketch", "mlsd" 
+  tasks_per_batch: 1
+  splits: [0.9, 0.1]
+  shots: 1
+  total_samples: 300000
+  batch_size: 1
+  num_workers: 1
+
+train:
+  accumulate_grad_batches: 4
+  # save_interval: 1000
+  # sample_interval: 100
+  gradient_checkpointing: false
+
+  optimizer:
+    type: "AdamW"
+    params:
+      lr: 0.0001
+      use_bias_correction: true
+      safeguard_warmup: true
+      weight_decay: 0.01

@@ -20,13 +20,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import register_to_config, ConfigMixin
 from diffusers.models.controlnets.controlnet_sd3 import SD3ControlNetOutput
-from diffusers.utils import BaseOutput, logging
-from diffusers.models import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.attention import JointTransformerBlock
 from diffusers.models.attention_processor import Attention, AttentionProcessor, FusedJointAttnProcessor2_0
+
+from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
+from diffusers.utils import BaseOutput, logging
 from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
 
 logger = logging.get_logger(__name__)
@@ -111,7 +111,7 @@ class SD3PromptDiffusionModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
         default_out_channels = in_channels
         self.out_channels = out_channels if out_channels is not None else default_out_channels
         self.inner_dim = num_attention_heads * attention_head_dim
-
+        self.down_proj = torch.nn.Conv2d(6, 3, kernel_size=3, padding=1)
         if use_pos_embed:
             self.pos_embed = PatchEmbed(
                 height=sample_size,
@@ -186,7 +186,16 @@ class SD3PromptDiffusionModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
         # self.example_pair_cond_embed_input = zero_module(example_pair_cond_embed_input)
 
         self.gradient_checkpointing = False
-
+    def encode_support_pair(self, cond, gt, vae=None):
+        pair = torch.cat([cond, gt], dim=1)  # [B, 6, H, W]
+        target_dtype = pair.dtype
+        if self.down_proj.weight.dtype != target_dtype:
+            self.down_proj = self.down_proj.to(dtype=target_dtype)
+        pair_p = self.down_proj(pair)        # [B, 3, H, W]
+        if vae is not None:
+            pair_p = pair_p.to(dtype=vae.dtype)
+            return vae.encode(pair_p).latent_dist.sample()
+        return pair_p
     # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
     def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
         """
@@ -361,7 +370,7 @@ class SD3PromptDiffusionModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
         timestep: torch.LongTensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+    ) -> Union[torch.Tensor, SD3ControlNetOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
 
