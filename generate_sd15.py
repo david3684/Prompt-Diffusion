@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader
 from promptdiffusioncontrolnet_sd3 import SD3PromptDiffusionModel
 from promptdiffusioncontrolnetpipeline_sd3 import SD3PromptDiffusionPipeLine
 from laion_meta_dataset import TASKS, ControlDataModule
-from coco2017val import TestDatamodule
-
+from promptdiffusioncontrolnet import PromptDiffusionControlNetModel
+from pipeline_prompt_diffusion import PromptDiffusionPipeline
 
 def taskidx_to_taskname(task_idx):
     """태스크 인덱스를 태스크 이름으로 변환"""
@@ -101,7 +101,7 @@ def main():
     parser = argparse.ArgumentParser(description="Prompt Diffusion 이미지 생성기")
     parser.add_argument("--config", type=str, required=True, help="설정 파일 경로")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="모델 체크포인트 경로")
-    parser.add_argument("--base_model", type=str, default="stabilityai/stable-diffusion-3.5-medium", help="베이스 모델 경로 또는 이름")
+    parser.add_argument("--base_model", type=str, default="sd-legacy/stable-diffusion-v1-5", help="베이스 모델 경로 또는 이름")
     parser.add_argument("--output_dir", type=str, default="./outputs/generated", help="출력 디렉토리")
     parser.add_argument("--gpu", type=int, default=0, help="사용할 GPU 번호")
     parser.add_argument("--batch_size", type=int, default=1, help="배치 크기")
@@ -114,36 +114,42 @@ def main():
     parser.add_argument("--task", type=str, default=None, help="특정 태스크만 생성 (예: hed, depth, canny)")
     args = parser.parse_args()
     
-
+    # 랜덤 시드 설정
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     
+    # 설정 파일 로드
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     
     data_config = config.get("data", {})
-
+    
+    # 디바이스 설정
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
+    # 모델 로드
     print(f"Loading model from {args.checkpoint_path}...")
-    controlnet = SD3PromptDiffusionModel.from_pretrained(
+    controlnet = PromptDiffusionControlNetModel.from_pretrained(
         args.checkpoint_path, torch_dtype=torch.float16
     )
     
     print(f"Loading base model from {args.base_model}...")
-    pipe = SD3PromptDiffusionPipeLine.from_pretrained(
+    pipe = PromptDiffusionPipeline.from_pretrained(
         args.base_model, controlnet=controlnet
     )
     pipe.to(device, torch.float16)
     
+    # 태스크 필터링 (특정 태스크만 사용할 경우)
     train_tasks = data_config.get("train_tasks", ["canny", "depth", "hed", "normal"])
     if args.task:
         if args.task not in train_tasks:
             print(f"Warning: {args.task} is not in train_tasks. Adding it.")
             train_tasks.append(args.task)
+        # 특정 태스크만 사용
         train_tasks = [args.task]
     
+    # 데이터 모듈 초기화
     print("Setting up data module...")
     datamodule = ControlDataModule(
         path=data_config.get("path", "/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman"),
@@ -159,10 +165,12 @@ def main():
         total_samples=data_config.get("total_samples", 10000),
     )
     datamodule.setup()
-
+    
+    # 테스트 데이터셋 준비
     if args.compute_fid:
         test_ds = datamodule.val_ds
     else:
+        # 적은 수의 샘플로 테스트
         indices = list(range(min(100, len(datamodule.val_ds))))
         test_ds = torch.utils.data.Subset(datamodule.val_ds, indices)
     
@@ -172,7 +180,8 @@ def main():
         num_workers=data_config.get("num_workers", 2),
         shuffle=False,
     )
-    
+    print(f"Test dataset size: {len(test_loader.dataset)}")
+    # 출력 디렉토리 설정
     model_name = os.path.basename(os.path.dirname(args.checkpoint_path))
     ckpt_name = os.path.basename(args.checkpoint_path)
     if "." in ckpt_name:
@@ -181,6 +190,7 @@ def main():
     output_dir = os.path.join(args.output_dir, model_name, ckpt_name)
     os.makedirs(output_dir, exist_ok=True)
     
+    # 태스크별 디렉토리 생성
     for task in train_tasks:
         task_dir = os.path.join(output_dir, task)
         os.makedirs(task_dir, exist_ok=True)
@@ -195,6 +205,7 @@ def main():
         if total_generated >= args.max_images:
             break
         
+        # 배치 데이터 추출
         images = batch["images"]              # [B, 2*shots, C, H, W]
         conditions = batch["conditions"]      # [B, T, 2*shots, C, H, W]
         prompts = batch["prompts"]            # List[List[str]] - [shots][B]
@@ -227,6 +238,7 @@ def main():
                     support_control = sp_cond[b, t, s].unsqueeze(0)       # [1, C, H, W]
                     support_gt = sp_image[b, s].unsqueeze(0)              # [1, C, H, W]
                     
+                    # 이미지 생성
                     with torch.no_grad():
                         generated = pipe(
                             prompt=curr_prompt,
@@ -235,8 +247,8 @@ def main():
                             num_inference_steps=args.num_inference_steps,
                             guidance_scale=args.guidance_scale,
                             negative_prompt="lowres, low quality, worst quality, blurry",
-                            control_image=query_control,
-                            control_image_pair=[support_gt, support_control],
+                            image=query_control,
+                            image_pair=[support_control, support_gt],
                             controlnet_conditioning_scale=args.conditioning_scale,
                             num_images_per_prompt=1,
                             generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
@@ -245,15 +257,19 @@ def main():
                     # 생성된 이미지
                     generated_image = generated.images[0]
                     
+                    # FID 계산 모드인 경우
                     if args.compute_fid:
+                        # 생성된 이미지 저장
                         fid_save_path = os.path.join(
                             output_dir, curr_task_name, "fid", f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}.png"
                         )
                         generated_image.save(fid_save_path)
                     else:
+                        # 시각화 결과 저장
                         vis_dir = os.path.join(output_dir, curr_task_name, "visualizations")
                         os.makedirs(vis_dir, exist_ok=True)
                         
+                        # 텐서를 이미지로 변환
                         query_control_np = query_control[0].permute(1, 2, 0).cpu().numpy()
                         support_control_np = support_control[0].permute(1, 2, 0).cpu().numpy()
                         support_gt_np = support_gt[0].permute(1, 2, 0).cpu().numpy()

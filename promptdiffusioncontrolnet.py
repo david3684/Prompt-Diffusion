@@ -16,11 +16,12 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 
 from diffusers.configuration_utils import register_to_config
-from diffusers.models.controlnet import (
+from diffusers.models.controlnets.controlnet import (
     ControlNetConditioningEmbedding,
     ControlNetModel,
     ControlNetOutput,
 )
+# from diffusers.models.controlnets.controlnet import ControlNetConditioningEmbedding
 from diffusers.utils import logging
 
 
@@ -177,6 +178,11 @@ class PromptDiffusionControlNetModel(ControlNetModel):
             conditioning_embedding_channels=block_out_channels[0],
             block_out_channels=conditioning_embedding_out_channels,
             conditioning_channels=3,
+        )
+        self.controlnet_cond_embedding = ControlNetConditioningEmbedding(
+            conditioning_embedding_channels=block_out_channels[0],
+            block_out_channels=conditioning_embedding_out_channels,
+            conditioning_channels=6,
         )
 
     def forward(

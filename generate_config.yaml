@@ -12,8 +12,8 @@ model:
     n_tasks: 8
 
 data:
-  path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman"
-  human_path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_human"
+  path: "/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman"
+  human_path: "/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_human"
   train_tasks: ['canny', 'depth', 'hed', 'normal']
   test_tasks: ['pose', 'densepose'] # "sketch", "mlsd" 
   tasks_per_batch: 2
