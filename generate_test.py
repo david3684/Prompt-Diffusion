@@ -21,26 +21,49 @@ from coco2017val import TestDatamodule
 
 
 def taskidx_to_taskname(task_idx):
-    """태스크 인덱스를 태스크 이름으로 변환"""
     for k, v in TASKS.items():
         if v == task_idx:
             return k
     return "unknown_task"
 
 
+def tensor_to_image(batch):
+    batch['task_indices'] = batch['task_indices'].squeeze(0)
+
+    batch['images'] = batch['images'].squeeze(0)
+    batch['images'] = torch.chunk(batch['images'], 2, dim=0)[0]
+    images = []
+    for i in range(batch['images'].shape[0]):
+        img = batch['images'][i]
+        img = rearrange(img, 'C H W -> H W C')
+        img = (img * 255).byte().numpy()
+        img = Image.fromarray(img)
+        images.append(img)
+    batch['images'] = images
+
+    batch['conditions'] = batch['conditions'].squeeze(0)
+    batch['conditions'] = torch.chunk(batch['conditions'], 2, dim=0)[0]
+    import ipdb; ipdb.set_trace()
+    conditions = []
+    for t in range(batch['conditions'].shape[0]):
+        task_conds = []
+        for i in range(batch['conditions'].shape[1]):
+            cond = batch['conditions'][t][i]
+            cond = rearrange(cond, 'C H W -> H W C')
+            
+            cond = cond.byte().numpy()
+            cond = Image.fromarray(cond)
+            task_conds.append(cond)
+        conditions.append(task_conds)
+    batch['conditions'] = conditions
+
+    prompts = batch['prompts']
+    batch['prompts'] = [prompts[i][0] for i in range(len(batch['images']))]  # an element in prompts is a tuple of len 1
+
+    return batch
+
+
 def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=None):
-    """
-    결과 시각화 함수 (모든 이미지가 0~1 범위로 정규화된 것으로 가정)
-    
-    Args:
-        gt: 정답 이미지 (0~1 범위, numpy 배열)
-        cond: 쿼리 조건 이미지 (0~1 범위, numpy 배열)
-        image: 생성된 이미지 (PIL 이미지)
-        sp_cond: 서포트 조건 이미지 리스트 (0~1 범위, numpy 배열)
-        sp_image: 서포트 이미지 리스트 (0~1 범위, numpy 배열)
-        prompt: 생성에 사용된 프롬프트
-        task_name: 태스크 이름 (canny, depth 등)
-    """
     n_col = 1 + len(sp_image)
     n_row = 3
     
@@ -50,19 +73,17 @@ def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=N
         title = f"Task: {task_name} - {title}"
     plt.suptitle(title)
     
-    # 1. 조건 이미지들 표시 - 이미 0~1 범위로 정규화되어 있음
     plt.subplot(n_row, n_col, 1)
-    plt.imshow(cond)  # 0~1 범위 유지
+    plt.imshow(cond)  
     plt.axis('off')
     plt.title("Query Condition")
     
     for i, c in enumerate(sp_cond):
         plt.subplot(n_row, n_col, i+2)
-        plt.imshow(c)  # 0~1 범위 유지
+        plt.imshow(c)  
         plt.axis('off')
         plt.title(f"Support {i+1}")
     
-    # 2. 생성된 이미지와 서포트 이미지 표시
     plt.subplot(n_row, n_col, n_col+1)
     image_np = np.array(image).astype(np.float32) / 255.0
     plt.imshow(np.clip(image_np, 0, 1))
@@ -111,7 +132,7 @@ def main():
     parser.add_argument("--max_images", type=int, default=5000, help="생성할 최대 이미지 수")
     parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
     parser.add_argument("--compute_fid", action="store_true", help="FID 계산용 이미지 저장 모드")
-    parser.add_argument("--task", type=str, default=None, help="특정 태스크만 생성 (예: hed, depth, canny)")
+    parser.add_argument("--coco_path", type=str, default="/data2/kietngt00/coco2017/val2017", help="COCO 데이터셋 경로")
     args = parser.parse_args()
     
 
@@ -137,41 +158,45 @@ def main():
     )
     pipe.to(device, torch.float16)
     
+    # 태스크 설정
     train_tasks = data_config.get("train_tasks", ["canny", "depth", "hed", "normal"])
-    if args.task:
-        if args.task not in train_tasks:
-            print(f"Warning: {args.task} is not in train_tasks. Adding it.")
-            train_tasks.append(args.task)
-        train_tasks = [args.task]
+    test_tasks = data_config.get("test_tasks", ['pose', 'densepose'])
     
-    print("Setting up data module...")
-    datamodule = ControlDataModule(
+    if not test_tasks:
+        test_tasks = train_tasks
+    
+    print(f"Using test tasks: {test_tasks}")
+    
+    print("Loading COCO test dataset...")
+    coco_datamodule = TestDatamodule(
+        path=args.coco_path,
+        tasks=test_tasks,
+        res=512,
+        batch_size=args.batch_size,
+        num_workers=data_config.get("num_workers", 2),
+    )
+    test_loader = coco_datamodule.test_dataloader()
+    
+    print("Loading LAION support dataset...")
+    laion_datamodule = ControlDataModule(
         path=data_config.get("path", "/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman"),
         human_path=data_config.get("human_path", "/data2/david3684/ufg_diff/datasets/laion_data/laion_human"),
         train_tasks=train_tasks,
-        test_tasks=data_config.get("test_tasks", []),
-        tasks_per_batch=1 if args.task else data_config.get("tasks_per_batch", 1),
+        test_tasks=test_tasks,
+        tasks_per_batch=data_config.get("tasks_per_batch", 1),
         splits=(0.9, 0.1),
         res=512,
         shots=data_config.get("shots", 1),
-        batch_size=args.batch_size,
+        batch_size=data_config.get("batch_size", 1),
         num_workers=data_config.get("num_workers", 2),
         total_samples=data_config.get("total_samples", 10000),
     )
-    datamodule.setup()
-
-    if args.compute_fid:
-        test_ds = datamodule.val_ds
-    else:
-        indices = list(range(min(100, len(datamodule.val_ds))))
-        test_ds = torch.utils.data.Subset(datamodule.val_ds, indices)
+    laion_datamodule.setup()
+    support_shots = data_config.get("shots", 1)
+    tuning_dl = laion_datamodule.tuning_dataloader(test_tasks, 15, 15)
+    supports = next(iter(tuning_dl))
+    supports = tensor_to_image(supports) 
     
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=args.batch_size,
-        num_workers=data_config.get("num_workers", 2),
-        shuffle=False,
-    )
     
     model_name = os.path.basename(os.path.dirname(args.checkpoint_path))
     ckpt_name = os.path.basename(args.checkpoint_path)
@@ -181,86 +206,112 @@ def main():
     output_dir = os.path.join(args.output_dir, model_name, ckpt_name)
     os.makedirs(output_dir, exist_ok=True)
     
-    for task in train_tasks:
+    for task in test_tasks:
         task_dir = os.path.join(output_dir, task)
         os.makedirs(task_dir, exist_ok=True)
         if args.compute_fid:
             os.makedirs(os.path.join(task_dir, "fid"), exist_ok=True)
     
-    # 이미지 생성 프로세스
     print("Starting image generation...")
     total_generated = 0
     
-    for batch_idx, batch in enumerate(tqdm(test_loader, desc="Generating images")):
+    for idx, batch in enumerate(tqdm(test_loader, desc="Generating images")):
         if total_generated >= args.max_images:
             break
         
-        images = batch["images"]              # [B, 2*shots, C, H, W]
-        conditions = batch["conditions"]      # [B, T, 2*shots, C, H, W]
-        prompts = batch["prompts"]            # List[List[str]] - [shots][B]
-        task_indices = batch["task_indices"]  # [B, T]
+
+        gt_images = batch['images'] # List: B * T PIL 이미지
+        q_cond = batch['q_cond'] # List: B * T PIL 이미지 
+        print(np.shape(gt_images), np.shape(q_cond))
+        prompts = batch['prompts'] # List: B * T
+        task_indices = batch['task_indices'] # List: B * T
+        filenames = batch['filenames'] # List: B * T
         
-        batch_size, num_tasks = task_indices.shape
-        shots = images.shape[1] // 2  # 각 이미지에 대한 샷 수
-        
-        # 쿼리 및 서포트 컨디션/이미지 분리
-        q_cond, sp_cond = torch.chunk(conditions, 2, dim=2)
-        gt_image, sp_image = torch.chunk(images, 2, dim=1)
-        
-        for b in range(batch_size):
-            for t in range(num_tasks):
-                # 현재 태스크 인덱스 및 이름 가져오기
-                curr_task_idx = task_indices[b, t].item()
-                curr_task_name = taskidx_to_taskname(curr_task_idx)
+        T = len(test_tasks)
+        B = len(batch['q_cond']) // T
+        S = support_shots
+
+        sp_image = supports['images']  # S 이미지 15 * H * W * C
+        sp_cond = supports['conditions']  # T [S 이미지] # B, T*15, H, W, C
+        print(np.shape(sp_image), np.shape(sp_cond))
+
+        for i in range(len(q_cond)):
+            if total_generated >= args.max_images:
+                break
                 
-                for s in range(shots):
-                    if total_generated >= args.max_images:
-                        break
+            # 현재 쿼리 이미지 및 태스크 정보
+            curr_q_cond = q_cond[i]
+            curr_prompt = prompts[i]
+            curr_task_idx = task_indices[i]
+            curr_task_name = taskidx_to_taskname(curr_task_idx)
+            curr_filename = filenames[i]
+            curr_gt_image = gt_images[i]
+            
+            task_index_in_supports = -1
+            for t, t_idx in enumerate(supports['task_indices']):
+                if t_idx.item() == curr_task_idx:
+                    task_index_in_supports = t
+                    break
                     
-                    # 현재 프롬프트
-                    curr_prompt = prompts[s][b]
-                    if not curr_prompt or curr_prompt.strip() == "":
-                        curr_prompt = f"Generate an image based on the {curr_task_name} conditioning"
-                    
-                    # 현재 쿼리 및 서포트 이미지
-                    query_control = q_cond[b, t, s].unsqueeze(0)         # [1, C, H, W]
-                    support_control = sp_cond[b, t, s].unsqueeze(0)       # [1, C, H, W]
-                    support_gt = sp_image[b, s].unsqueeze(0)              # [1, C, H, W]
-                    
-                    with torch.no_grad():
-                        generated = pipe(
-                            prompt=curr_prompt,
-                            height=512,
-                            width=512,
-                            num_inference_steps=args.num_inference_steps,
-                            guidance_scale=args.guidance_scale,
-                            negative_prompt="lowres, low quality, worst quality, blurry",
-                            control_image=query_control,
-                            control_image_pair=[support_gt, support_control],
-                            controlnet_conditioning_scale=args.conditioning_scale,
-                            num_images_per_prompt=1,
-                            generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
-                        )
+            if task_index_in_supports == -1:
+                print(f"Warning: Task {curr_task_name} (index {curr_task_idx}) not found in supports. Skipping.")
+                continue
+                
+            sp_indices = np.random.choice(len(sp_image), S, replace=False)
+            curr_sp_image = [sp_image[j] for j in sp_indices]
+            print(task_index_in_supports, sp_indices)
+            curr_sp_cond = [sp_cond[0][j+15*task_index_in_supports] for j in sp_indices]
+            import ipdb; ipdb.set_trace()
+            print(np.shape(curr_sp_cond))
+            # curr_sp_cond = [sp_cond[task_index_in_supports][j] for j in sp_indices]
+            
+            query_control = torch.from_numpy(np.array(curr_q_cond)).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
+            support_images = []
+            support_controls = []
+            
+            for j in range(len(curr_sp_image)):
+                sp_img = torch.from_numpy(np.array(curr_sp_image[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
+                sp_ctrl = torch.from_numpy(np.array(curr_sp_cond[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
+                support_images.append(sp_img)
+                support_controls.append(sp_ctrl)
+            
+            # 이미지 생성
+            with torch.no_grad():
+                for sp_idx in range(len(support_images)):
+                    generated = pipe(
+                        prompt=curr_prompt,
+                        height=512,
+                        width=512,
+                        num_inference_steps=args.num_inference_steps,
+                        guidance_scale=args.guidance_scale,
+                        negative_prompt="lowres, low quality, worst quality, blurry",
+                        control_image=query_control,
+                        control_image_pair=[support_images[sp_idx], support_controls[sp_idx]],
+                        controlnet_conditioning_scale=args.conditioning_scale,
+                        num_images_per_prompt=1,
+                        generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
+                    )
                     
                     # 생성된 이미지
                     generated_image = generated.images[0]
                     
                     if args.compute_fid:
                         fid_save_path = os.path.join(
-                            output_dir, curr_task_name, "fid", f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}.png"
+                            output_dir, curr_task_name, "fid", f"{curr_filename}"
                         )
                         generated_image.save(fid_save_path)
                     else:
                         vis_dir = os.path.join(output_dir, curr_task_name, "visualizations")
                         os.makedirs(vis_dir, exist_ok=True)
                         
+                        # numpy 배열로 변환 (시각화용)
                         query_control_np = query_control[0].permute(1, 2, 0).cpu().numpy()
-                        support_control_np = support_control[0].permute(1, 2, 0).cpu().numpy()
-                        support_gt_np = support_gt[0].permute(1, 2, 0).cpu().numpy()
-                        gt_img_np = gt_image[b, s].permute(1, 2, 0).cpu().numpy()
+                        support_control_np = support_controls[sp_idx][0].permute(1, 2, 0).cpu().numpy()
+                        support_gt_np = support_images[sp_idx][0].permute(1, 2, 0).cpu().numpy()
+                        gt_img_np = np.array(curr_gt_image).astype(np.float32) / 255.0
                         
                         vis_save_path = os.path.join(
-                            vis_dir, f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}.jpg"
+                            vis_dir, f"{os.path.splitext(curr_filename)[0]}_sp{sp_idx}.jpg"
                         )
                         
                         plot = visualize_generation(

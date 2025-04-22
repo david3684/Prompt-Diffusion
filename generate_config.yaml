@@ -15,8 +15,8 @@ data:
   path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman"
   human_path: "/data2/david3684/ufg_diff/datasets/laion_data/laion_human"
   train_tasks: ['canny', 'depth', 'hed', 'normal']
-  test_tasks: [] # "sketch", "mlsd" 
-  tasks_per_batch: 1
+  test_tasks: ['pose', 'densepose'] # "sketch", "mlsd" 
+  tasks_per_batch: 2
   splits: [0.9, 0.1]
   shots: 1
   total_samples: 300000
