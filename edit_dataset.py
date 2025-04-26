@@ -2,161 +2,145 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
+from glob import glob
 
 import numpy as np
 import torch
-import torchvision
-from einops import rearrange
+import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import Dataset
 
-from annotator.util import HWC3
 
+TASK_MAPPING = {
+    'pose': 'human',
+    'densepose': 'human',
+    'canny': 'nonhuman',
+    'depth': 'nonhuman',
+    'hed': 'nonhuman',
+    'normal': 'nonhuman',
+}
 
 class EditDataset(Dataset):
     def __init__(
         self,
         path: str,
+        task_list = ['canny', 'depth', 'hed', 'normal'],
         split: str = "train",
-        splits: tuple[float, float, float] = (0.9, 0.05, 0.05),
+        splits: tuple[float, float] = (0.9, 0.1), 
         min_resize_res: int = 256,
         max_resize_res: int = 256,
         crop_res: int = 256,
         flip_prob: float = 0.0,
         prompt_option: str = 'edit',
+        max_samples_per_task: int = 150000, 
     ):
-        assert split in ("train", "val", "test")
+        assert split in ("train", "val")  
         assert sum(splits) == 1
         self.path = path
         self.min_resize_res = min_resize_res
         self.max_resize_res = max_resize_res
         self.crop_res = crop_res
         self.flip_prob = flip_prob
-
-        with open(Path(self.path, "seeds.json")) as f:
-            self.seeds = json.load(f)
-
-        split_0, split_1 = {
-            "train": (0.0, splits[0]),
-            "val": (splits[0], splits[0] + splits[1]),
-            "test": (splits[0] + splits[1], 1.0),
-        }[split]
-
-        idx_0 = math.floor(split_0 * len(self.seeds))
-        idx_1 = math.floor(split_1 * len(self.seeds))
-        self.seeds = self.seeds[idx_0:idx_1]
-
+        self.task_list = task_list
+        self.max_samples_per_task = max_samples_per_task
         self.prompt_option = prompt_option
-
+        self.split = split
+        train_ratio, val_ratio = splits
+        
+        self.file_mapping = {task: [] for task in task_list}
+        
+        for task in task_list:
+            folder_type = TASK_MAPPING[task]
+            base_path = os.path.join(self.path, f"laion_{folder_type}")
+            
+            files = []
+            subdirs = glob(os.path.join(base_path, "*/"))
+            for subdir in subdirs:
+                img_files = glob(os.path.join(subdir, "*.jpg"))
+                for img_file in img_files:
+                    filename = os.path.basename(img_file)
+                    dir_name = os.path.basename(os.path.dirname(img_file))
+                    
+                    control_path = os.path.join(base_path, dir_name, task, filename)
+                    txt_path = img_file.replace('.jpg', '.txt')
+                    
+                    files.append({
+                        'gt_path': img_file,
+                        'dir_name': dir_name,
+                        'filename': filename,
+                        'control_path': control_path,
+                        'txt_path': txt_path,
+                        'base_path': base_path
+                    })
+            
+            files.sort(key=lambda x: x['gt_path'])
+            
+            if len(files) > self.max_samples_per_task:
+                files = files[:self.max_samples_per_task]
+            
+            if split == "train":
+                idx_end = math.floor(train_ratio * len(files))
+                self.file_mapping[task] = files[:idx_end]
+            else:  # val
+                idx_start = math.floor(train_ratio * len(files))
+                self.file_mapping[task] = files[idx_start:]
+            
+            print(f"Task {task}: {len(self.file_mapping[task])} {split} samples")
+        
+        self.max_task_size = max([len(files) for files in self.file_mapping.values()], default=0)
+        print(f"EditDataset loaded: using max task size of {self.max_task_size} samples")
+            
     def __len__(self) -> int:
-        return len(self.seeds)
+        return self.max_task_size
 
     def __getitem__(self, i: int) -> dict[str, Any]:
-        name, seeds = self.seeds[i]
-        propt_dir = Path(self.path, name)
-        example_seed = seeds[torch.randint(0, len(seeds), ()).item()]
-        seed = seeds[torch.randint(0, len(seeds), ()).item()]
-
-        # Load text prompt
-        with open(propt_dir.joinpath("prompt.json")) as fp:
-            prompt = json.load(fp)
-            prompt = prompt['output']
-
-        # Load input and output images; shape -> h w c
-        image_0 = Image.open(propt_dir.joinpath(f"{example_seed}_0.jpg"))
-        image_1 = Image.open(propt_dir.joinpath(f"{seed}_1.jpg"))
-
-        reize_res = torch.randint(self.min_resize_res, self.max_resize_res + 1, ()).item()
-        image_0 = image_0.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-        image_1 = image_1.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-
-        image_0 = 2 * torch.tensor(np.array(image_0)).float() / 255. - 1
-        image_1 = 2 * torch.tensor(np.array(image_1)).float() / 255. - 1
-
-        # Load Controls; shape -> h w c
-        task = np.random.choice(['inv_seg', 'inv_depth', 'inv_hed', 'seg', 'depth', 'hed'])
+        task = np.random.choice(self.task_list)
+        
+        task_files = self.file_mapping[task]
+        
+        file_idx = i % len(task_files)
+        file_data = task_files[file_idx]
+        
+        gt_path = file_data['gt_path']
+        base_path = file_data['base_path'] 
+        dir_name = file_data['dir_name']
+        filename = file_data['filename']
+        control_query_path = file_data['control_path']
+        txt_path = file_data['txt_path']
+        
+        same_folder_files = [f for f in self.file_mapping[task] 
+                            if f['dir_name'] == dir_name and f['gt_path'] != gt_path]
+        
+        support_data = np.random.choice(same_folder_files)
+        
+        support_file = support_data['gt_path']
+        support_filename = support_data['filename']
+        control_support_path = os.path.join(base_path, dir_name, task, support_filename)
+        
+        image_q = Image.open(gt_path).convert('RGB')        
+        image_q = 2 * torch.tensor(np.array(image_q)).float() / 255. - 1  
+        
+        image_sp = Image.open(support_file).convert('RGB')
+        image_sp = 2 * torch.tensor(np.array(image_sp)).float() / 255. - 1  # [-1, 1] 
+        
+        with open(txt_path, 'r') as f:
+            prompt = f.read().strip()
+        
         txt_log = task
-        if task == 'inv_seg':
-            image_seg = Image.open(propt_dir.joinpath(f"{example_seed}_0_seg.jpg"))
-            image_seg = image_seg.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_seg = 2 * torch.tensor(np.array(image_seg)).float() / 255. - 1
-
-            example_pair = torch.cat((image_seg, image_0), dim=2) # h w c
-
-            image_query = Image.open(propt_dir.joinpath(f"{seed}_1_seg.jpg"))
-            image_query = image_query.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_query = 2 * torch.tensor(np.array(image_query)).float() / 255. - 1
-
-            image_target = image_1
-
-        elif task == 'seg':
-            image_seg = Image.open(propt_dir.joinpath(f"{example_seed}_0_seg.jpg"))
-            image_seg = image_seg.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_seg = 2 *  torch.tensor(np.array(image_seg)).float() / 255. - 1
-
-            example_pair = torch.cat((image_0, image_seg), dim=2)  # h w c
-            image_query = image_1
-            prompt = 'segmentation map'
-
-            image_target = Image.open(propt_dir.joinpath(f"{seed}_1_seg.jpg"))
-            image_target = image_target.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_target = 2 * torch.tensor(np.array(image_target)).float() / 255. - 1
-
-        elif task == 'inv_depth':
-            image_depth = Image.open(propt_dir.joinpath(f"{example_seed}_0_depth.jpg"))
-            image_depth = image_depth.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_depth = 2 * torch.tensor(HWC3(np.array(image_depth))).float() / 255. - 1
-
-            example_pair = torch.cat((image_depth, image_0), dim=2)  # h w c
-
-            image_query = Image.open(propt_dir.joinpath(f"{seed}_1_depth.jpg"))
-            image_query = image_query.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_query = 2 * torch.tensor(HWC3(np.array(image_query))).float() / 255. - 1
-
-            image_target = image_1
-
-        elif task == 'depth':
-            image_depth = Image.open(propt_dir.joinpath(f"{example_seed}_0_depth.jpg"))
-            image_depth = image_depth.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_depth = 2 * torch.tensor(HWC3(np.array(image_depth))).float() / 255. - 1
-
-            example_pair = torch.cat((image_0, image_depth), dim=2)  # h w c
-            image_query = image_1
-            prompt = 'depth map'
-
-            image_target = Image.open(propt_dir.joinpath(f"{seed}_1_depth.jpg"))
-            image_target = image_target.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_target = 2 * torch.tensor(HWC3(np.array(image_target))).float() / 255. - 1
-
-        elif task == 'inv_hed':
-
-            image_hed = Image.open(propt_dir.joinpath(f"{example_seed}_0_hed.jpg"))
-            image_hed = image_hed.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_hed = 2 * torch.tensor(HWC3(np.array(image_hed))).float() / 255. - 1
-
-            example_pair = torch.cat((image_hed, image_0), dim=2)  # h w c
-
-            image_query = Image.open(propt_dir.joinpath(f"{seed}_1_hed.jpg"))
-            image_query = image_query.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_query = 2 * torch.tensor(HWC3(np.array(image_query))).float() / 255. - 1
-
-            image_target = image_1
-
-        elif task == 'hed':
-
-            image_hed = Image.open(propt_dir.joinpath(f"{example_seed}_0_hed.jpg"))
-            image_hed = image_hed.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_hed = 2 * torch.tensor(HWC3(np.array(image_hed))).float() / 255. - 1
-
-            example_pair = torch.cat((image_0, image_hed), dim=2)  # h w c
-            image_query = image_1
-            prompt = 'hed map'
-
-            image_target = Image.open(propt_dir.joinpath(f"{seed}_1_hed.jpg"))
-            image_target = image_target.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
-            image_target = 2 * torch.tensor(HWC3(np.array(image_target))).float() / 255. - 1
-
+        
+        control_q = Image.open(control_query_path).convert('RGB')
+        control_q = torch.tensor(np.array(control_q)).float() / 255.0  # [0, 1] 
+            
+        control_sp = Image.open(control_support_path).convert('RGB')
+        control_sp = torch.tensor(np.array(control_sp)).float() / 255.0  # [0, 1] 
+        
+        # example_pair 
+        example_pair = torch.cat((control_sp, image_sp), dim=2)  # h w c
+        image_query = control_q
+        image_target = image_q
+        
         return dict(jpg=image_target, txt=prompt, query=image_query, example_pair=example_pair, txt_log=txt_log)
 
