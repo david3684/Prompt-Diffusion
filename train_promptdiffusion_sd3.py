@@ -567,6 +567,9 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--laion_data_path", type=str, default="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/", help="The column of the dataset containing the target image."
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
@@ -1030,8 +1033,8 @@ def main(args):
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
     data_module = ControlDataModule(
-        path="/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman",  # 경로는 args.train_data_dir 사용
-        human_path="/data2/david3684/ufg_diff/datasets/laion_data/laion_human",
+        path=os.path.join(args.laion_data_path, "/human"),  # 경로는 args.train_data_dir 사용
+        human_path=os.path.join(args.laion_data_path, "/nonhuman"),
         train_tasks=['canny', 'depth', 'hed', 'normal'], 
         test_tasks=[], 
         tasks_per_batch=1,

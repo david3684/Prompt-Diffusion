@@ -209,7 +209,6 @@ def main():
         
         for b in range(batch_size):
             for t in range(num_tasks):
-                # 현재 태스크 인덱스 및 이름 가져오기
                 curr_task_idx = task_indices[b, t].item()
                 curr_task_name = taskidx_to_taskname(curr_task_idx)
                 
