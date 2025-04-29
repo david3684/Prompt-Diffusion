@@ -194,8 +194,11 @@ def log_generated_images(
                     wandb.Image(query_cond, caption="Query Condition"),
                     wandb.Image(support_cond, caption="Support Condition"),
                     wandb.Image(support_image, caption="Support Image")
-                ] + [wandb.Image(img, caption="Generated") for img in generated_images]
-                tracker.log({f"validation/{task}": wandb_images})
+                ] + [wandb.Image(img, caption=f"Generated: {prompt}") for img in generated_images]
+                tracker.log({
+                    f"validation/{task}/images": wandb_images,
+                    f"validation/{task}/prompt": prompt
+                })
         else:
             logger.warning(f"Image logging not implemented for {tracker.name}")
 
@@ -896,7 +899,7 @@ def main(args):
     data_module = ControlDataModule(
         path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman",  # 경로는 args.train_data_dir 사용
         human_path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_human",
-        train_tasks=['canny', 'depth', 'hed', 'normal'], 
+        train_tasks=args.train_tasks, 
         test_tasks=[], 
         tasks_per_batch=args.tasks_per_batch,
         splits=(0.9, 0.1),
