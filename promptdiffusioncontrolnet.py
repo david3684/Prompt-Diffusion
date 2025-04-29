@@ -321,7 +321,7 @@ class PromptDiffusionControlNetModel(ControlNetModel):
 
         # 2. pre-process
         sample = self.conv_in(sample)
-
+        
         controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
         controlnet_query_cond = self.controlnet_query_cond_embedding(controlnet_query_cond)
         sample = sample + controlnet_cond + controlnet_query_cond

@@ -47,6 +47,7 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
+from pipeline_prompt_diffusion import PromptDiffusionPipeline
 from laion_meta_dataset import ControlDataModule
 from promptdiffusioncontrolnet import PromptDiffusionControlNetModel
 from diffusers.optimization import get_scheduler
@@ -74,6 +75,134 @@ def image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
+
+def log_generated_images(
+    vae, text_encoder, tokenizer, unet, controlnet, pipeline_cls, args, accelerator, weight_dtype, step, batch
+):
+    logger.info("Running image generation for logging...")
+
+    # Unwrap controlnet
+    controlnet = accelerator.unwrap_model(controlnet)
+    if is_compiled_module(controlnet):
+        controlnet = controlnet._orig_mod
+
+    # Initialize pipeline
+    pipeline = PromptDiffusionPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        controlnet=controlnet,
+        scheduler=UniPCMultistepScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler"
+        ),
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    imgs = batch["images"]  # [B, 2, C, H, W]
+    conds = batch["conditions"]  # [B, T, 2, C, H, W]
+    prompts = batch["prompts"]  # List of tuples: [(gt_prompts), (support_prompts)]
+    task_indices = batch["task_indices"]  # [T]
+
+    # Use only the first sample (b=0) and first task (t=0)
+    gt_img = imgs[0, 0]  # [C, H, W]
+    support_img = imgs[0, 1]  # [C, H, W]
+    query_cond = conds[0, 0, 0]  # [C, H, W]
+    support_cond = conds[0, 0, 1]  # [C, H, W]
+    prompt = prompts[0][0]  # Single prompt
+    task = args.train_tasks[task_indices[0][0].item()]  # Single task
+
+    def tensor_to_pil(tensor):
+        tensor = tensor.cpu().permute(1, 2, 0).float().numpy()  # [H, W, C]
+        tensor = (tensor * 255).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(tensor)
+
+    gt_pil = tensor_to_pil(gt_img)
+    support_pil = tensor_to_pil(support_img)
+    query_cond_pil = tensor_to_pil(query_cond)
+    support_cond_pil = tensor_to_pil(support_cond)
+
+    image = query_cond_pil
+    image_pair = [support_cond_pil, support_pil]
+
+    # Generate a single image
+    generated_images = []
+    with torch.autocast("cuda"):
+        output = pipeline(
+            prompt=prompt,
+            image=image,
+            image_pair=image_pair,
+            num_inference_steps=24,
+            guidance_scale=5.0,
+            negative_prompts='lowres, low quality, worst quality',
+            generator=torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None,
+            output_type="pil",
+        )
+        generated_image = output.images[0]
+        generated_images.append(generated_image)
+
+    # Log images
+    image_logs = [{
+        "gt_image": gt_pil,
+        "generated_images": generated_images,
+        "query_cond": query_cond_pil,
+        "support_image": support_pil,
+        "support_cond": support_cond_pil,
+        "prompt": prompt,
+        "task": task
+    }]
+
+    # Log to trackers
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            for log in image_logs:
+                gt_image = log["gt_image"]
+                query_cond = log["query_cond"]
+                support_cond = log["support_cond"]
+                support_image = log["support_image"]
+                generated_images = log["generated_images"]
+                prompt = log["prompt"]
+                task = log["task"]
+
+                formatted_images = [
+                    np.asarray(gt_image),
+                    np.asarray(query_cond),
+                    np.asarray(support_cond),
+                    np.asarray(support_image)
+                ] + [np.asarray(img) for img in generated_images]
+                formatted_images = np.stack(formatted_images)
+
+                tracker.writer.add_images(
+                    f"{task}/{prompt[:50]}", formatted_images, step, dataformats="NHWC"
+                )
+        elif tracker.name == "wandb":
+            for log in image_logs:
+                gt_image = log["gt_image"]
+                query_cond = log["query_cond"]
+                support_cond = log["support_cond"]
+                support_image = log["support_image"]
+                generated_images = log["generated_images"]
+                prompt = log["prompt"]
+                task = log["task"]
+
+                wandb_images = [
+                    wandb.Image(gt_image, caption="Ground Truth"),
+                    wandb.Image(query_cond, caption="Query Condition"),
+                    wandb.Image(support_cond, caption="Support Condition"),
+                    wandb.Image(support_image, caption="Support Image")
+                ] + [wandb.Image(img, caption="Generated") for img in generated_images]
+                tracker.log({f"validation/{task}": wandb_images})
+        else:
+            logger.warning(f"Image logging not implemented for {tracker.name}")
+
+    # Cleanup
+    del pipeline
+    torch.cuda.empty_cache()
+    return image_logs
 
 
 def log_validation(
@@ -252,7 +381,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="sd-legacy/stable-diffusion-v1-5",
+        default="stable-diffusion-v1-5/stable-diffusion-v1-5",
         required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
@@ -276,13 +405,8 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
-    parser.add_argument(
-        "--control_type",
-        type=str,
-        default="canny",
-        choices=["hed", "depth", "normal", "canny", "mlsd", "seg", "densepose", "pose"],
-        help="Control type for LAION ControlNet dataset",
-    )
+    parser.add_argument('--train_tasks', nargs='+', default=['canny', 'depth', 'hed', 'normal'], 
+                   help='Local control type list')
     parser.add_argument(
         "--tokenizer_name",
         type=str,
@@ -292,7 +416,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="sd15-controlnet",
+        default="sd15_pd",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -526,29 +650,6 @@ def parse_args(input_args=None):
         help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).",
     )
     parser.add_argument(
-        "--validation_prompt",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
-            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
-            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
-        ),
-    )
-    parser.add_argument(
-        "--validation_image",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of paths to the controlnet conditioning image be evaluated every `--validation_steps`"
-            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
-            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
-            " `--validation_image` that will be used with all `--validation_prompt`s."
-        ),
-    )
-    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=4,
@@ -585,24 +686,6 @@ def parse_args(input_args=None):
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
 
-    if args.validation_prompt is not None and args.validation_image is None:
-        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
-
-    if args.validation_prompt is None and args.validation_image is not None:
-        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
-
-    if (
-        args.validation_image is not None
-        and args.validation_prompt is not None
-        and len(args.validation_image) != 1
-        and len(args.validation_prompt) != 1
-        and len(args.validation_image) != len(args.validation_prompt)
-    ):
-        raise ValueError(
-            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
-            " or the same number of `--validation_prompt`s and `--validation_image`s"
-        )
-
     if args.resolution % 8 != 0:
         raise ValueError(
             "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
@@ -621,7 +704,8 @@ def main(args):
         )
 
     logging_dir = Path(args.output_dir, args.logging_dir)
-
+    train_tasks_str = '_'.join(args.train_tasks)
+    args.output_dir = os.path.join(args.output_dir, train_tasks_str)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
@@ -882,10 +966,6 @@ def main(args):
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
 
-        # tensorboard cannot handle list types for config
-        tracker_config.pop("validation_prompt")
-        tracker_config.pop("validation_image")
-
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     # Train!
@@ -935,7 +1015,7 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    
+
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -946,21 +1026,15 @@ def main(args):
                 conds = batch["conditions"]
                 gt_imgs = imgs[:,0]
                 support_imgs = imgs[:,1]
-
-                B = gt_imgs.shape[0]
-                T = conds.shape[1]  # tasks_per_batch
                 query_conds = conds[:,:,0]
                 support_conds = conds[:,:,1]
                 
-                gt_latents = vae.encode(gt_imgs.to(dtype=weight_dtype)).latent_dist.sample()
-                gt_latents = gt_latents * vae.config.scaling_factor
-                
-                # TODO check: support not into latent?
-                # support_latents = vae.encode(support_imgs.to(dtype=weight_dtype)).latent_dist.sample()
-                # support_latents = support_latents * vae.config.scaling_factor
-                # latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
-                # latents = latents * vae.config.scaling_factor
+                B = gt_imgs.shape[0]
+                T = conds.shape[1]  
 
+                # Convert only ground truth images to latent space using VAE
+                gt_latents = vae.encode(gt_imgs).latent_dist.sample()            
+                gt_latents = gt_latents * vae.config.scaling_factor
                 noise = torch.randn_like(gt_latents)
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (B,), device=gt_latents.device)
                 timesteps = timesteps.long()
@@ -975,12 +1049,7 @@ def main(args):
                 noisy_model_input = noisy_latents.reshape(B * T, noisy_latents.shape[2], noisy_latents.shape[3], noisy_latents.shape[4])  # [B*T, C', H', W']
                 timesteps = timesteps.unsqueeze(1).repeat(1, T).reshape(B * T)  # [B*T]
 
-                query_prompts = []
-                for prompt_tuple in batch["prompts"]:
-                    if isinstance(prompt_tuple, (tuple, list)) and len(prompt_tuple) > 0:
-                        query_prompts.append(prompt_tuple[0])
-                    else:
-                        query_prompts.append(prompt_tuple)
+                query_prompts = list(batch['prompts'][0])
 
                 tokenized_prompts = tokenizer(
                     query_prompts, 
@@ -990,27 +1059,27 @@ def main(args):
                     return_tensors="pt"
                 ).input_ids.to(accelerator.device)
                 encoder_hidden_states = text_encoder(tokenized_prompts, return_dict=False)[0]
-
+                # import ipdb; ipdb.set_trace()
                 encoder_hidden_states = encoder_hidden_states.unsqueeze(1).repeat(1, T, 1, 1)  # [B, T, seq_len, hidden_size]
-                encoder_hidden_states = encoder_hidden_states.reshape(B*T, encoder_hidden_states.shape[2], encoder_hidden_states.shape[3])
+                encoder_hidden_states = encoder_hidden_states.reshape(B * T, *encoder_hidden_states.shape[2:])
 
                 # controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                Cc, Hc, Wc = query_conds.shape[2], query_conds.shape[3], query_conds.shape[4]
-                qc_flat = query_conds.reshape(B * T, Cc, Hc, Wc)  # [B*T, C, H, W]
-                sc_flat = support_conds.reshape(B * T, Cc, Hc, Wc)  # [B*T, C, H, W]
-                sg_flat = support_imgs.unsqueeze(1).expand(B, T, Cc, Hc, Wc).reshape(B * T, Cc, Hc, Wc)  # [B*T, C, H, W]
+                query_conds_flat = query_conds.reshape(B * T, *query_conds.shape[2:])  # [B*T, C, H, W]
+                support_conds_flat = support_conds.reshape(B * T, *support_conds.shape[2:])  # [B*T, C, H, W]
+                support_imgs_expanded = support_imgs.unsqueeze(1).expand(B, T, *support_imgs.shape[1:])  # [B, T, C, H, W]
+                support_imgs_flat = support_imgs_expanded.reshape(B * T, *support_imgs.shape[1:])  # [B*T, C, H, W]
 
-                # 컨트롤넷에 전달
+                controlnet_cond = torch.cat([support_conds_flat, support_imgs_flat], dim=1)
+                # import ipdb; ipdb.set_trace()
                 down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_model_input,
-                    timesteps,
+                    sample = noisy_model_input,
+                    timestep = timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    controlnet_query_cond=qc_flat,
-                    controlnet_cond=torch.cat([sc_flat, sg_flat], dim=1),
+                    controlnet_query_cond=query_conds_flat,
+                    controlnet_cond=controlnet_cond,
                     return_dict=False,
                 )
 
-                # Predict the noise residual
                 model_pred = unet(
                     noisy_model_input,
                     timesteps,
@@ -1073,17 +1142,19 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
-                            vae,
-                            text_encoder,
-                            tokenizer,
-                            unet,
-                            controlnet,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
+                    if global_step % args.validation_steps == 0:
+                        log_generated_images(
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            unet=unet,
+                            controlnet=controlnet,
+                            pipeline_cls=PromptDiffusionPipeline,
+                            args=args,
+                            accelerator=accelerator,
+                            weight_dtype=weight_dtype,
+                            step=global_step,
+                            batch=batch,
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}

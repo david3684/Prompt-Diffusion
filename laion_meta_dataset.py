@@ -56,7 +56,7 @@ class LaionBaseDataset(Dataset):
         filenames = []
         for dir in dirs:
             filenames += glob(dir + "*.jpg")
-        # TODO: Fix the filenames order by sort
+        filenames.sort()
         # NOTE: keep it as it as on server 14 to make fair training experiments
         self.filenames = [filenames[i] for i in indices]
         self.num_filegroups = len(self.filenames) // self.shots
