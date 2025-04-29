@@ -1269,10 +1269,8 @@ class SD3PromptDiffusionPipeLine(
 
         else:
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-
+            # import ipdb; ipdb.set_trace()
             image = self.vae.decode(latents, return_dict=False)[0]
-            print(image.min().item(), image.max().item())
-            print(image)
             image = self.postprocess(image, output_type=output_type)
 
         # Offload all models

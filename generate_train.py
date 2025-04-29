@@ -112,6 +112,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
     parser.add_argument("--compute_fid", action="store_true", help="FID 계산용 이미지 저장 모드")
     parser.add_argument("--task", type=str, default=None, help="특정 태스크만 생성 (예: hed, depth, canny)")
+    parser.add_argument("--black_support", action="store_true", default=None)
     args = parser.parse_args()
     
 
@@ -223,8 +224,12 @@ def main():
                     
                     # 현재 쿼리 및 서포트 이미지
                     query_control = q_cond[b, t, s].unsqueeze(0)         # [1, C, H, W]
-                    support_control = sp_cond[b, t, s].unsqueeze(0)       # [1, C, H, W]
-                    support_gt = sp_image[b, s].unsqueeze(0)              # [1, C, H, W]
+                    if args.black_support:
+                        support_control = torch.zeros_like(sp_cond[b, t, s].unsqueeze(0), device=device, dtype=torch.float16)
+                        support_gt = torch.zeros_like(sp_image[b, s].unsqueeze(0), device=device, dtype=torch.float16)
+                    else:
+                        support_control = sp_cond[b, t, s].unsqueeze(0)       # [1, C, H, W]
+                        support_gt = sp_image[b, s].unsqueeze(0)           # [1, C, H, W]
                     
                     with torch.no_grad():
                         generated = pipe(
@@ -235,7 +240,7 @@ def main():
                             guidance_scale=args.guidance_scale,
                             negative_prompt="lowres, low quality, worst quality, blurry",
                             control_image=query_control,
-                            control_image_pair=[support_gt, support_control],
+                            control_image_pair=[support_control, support_gt],
                             controlnet_conditioning_scale=args.conditioning_scale,
                             num_images_per_prompt=1,
                             generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
@@ -250,18 +255,41 @@ def main():
                         )
                         generated_image.save(fid_save_path)
                     else:
+                        # 시각화 이미지 저장 디렉토리
                         vis_dir = os.path.join(output_dir, curr_task_name, "visualizations")
                         os.makedirs(vis_dir, exist_ok=True)
                         
+                        # 원본 생성 이미지 저장 디렉토리
+                        raw_dir = os.path.join(output_dir, curr_task_name, "raw_images")
+                        os.makedirs(raw_dir, exist_ok=True)
+                        
+                        # 원본 이미지 저장 (black_support 여부 표시)
+                        filename_suffix = "_black" if args.black_support else ""
+                        raw_save_path = os.path.join(
+                            raw_dir, f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}{filename_suffix}.png"
+                        )
+                        generated_image.save(raw_save_path)
+                        
+                        # 시각화를 위한 이미지 준비
                         query_control_np = query_control[0].permute(1, 2, 0).cpu().numpy()
-                        support_control_np = support_control[0].permute(1, 2, 0).cpu().numpy()
-                        support_gt_np = support_gt[0].permute(1, 2, 0).cpu().numpy()
+                        
+                        if args.black_support:
+                            # 검정색 이미지로 시각화
+                            support_control_np = np.zeros((512, 512, 3))
+                            support_gt_np = np.zeros((512, 512, 3))
+                        else:
+                            support_control_np = sp_cond[b, t, s].permute(1, 2, 0).cpu().numpy()
+                            support_gt_np = sp_image[b, s].permute(1, 2, 0).cpu().numpy()
+                        
                         gt_img_np = gt_image[b, s].permute(1, 2, 0).cpu().numpy()
                         
+                        # 시각화 저장 경로에 black_support 여부 표시
+                        vis_filename_suffix = "black_" if args.black_support else ""
                         vis_save_path = os.path.join(
-                            vis_dir, f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}.jpg"
+                            vis_dir, f"{batch_idx:04d}_{b:02d}_{t:02d}_{s:02d}_{vis_filename_suffix}vis.jpg"
                         )
                         
+                        # 생성된 이미지 시각화
                         plot = visualize_generation(
                             gt=gt_img_np,
                             cond=query_control_np,
@@ -272,6 +300,11 @@ def main():
                             task_name=curr_task_name
                         )
                         plot.save(vis_save_path)
+                        
+                        # 디버깅 정보 출력
+                        print(f"Generated image with {'black' if args.black_support else 'normal'} support")
+                        print(f"Saved raw image to: {raw_save_path}")
+                        print(f"Saved visualization to: {vis_save_path}")
                     
                     total_generated += 1
     

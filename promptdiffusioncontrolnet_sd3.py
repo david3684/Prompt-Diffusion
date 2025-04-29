@@ -438,7 +438,7 @@ class SD3PromptDiffusionModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOri
 
         # add
         hidden_states = hidden_states + self.pos_embed_input(controlnet_cond) + self.pos_embed_input(controlnet_example_pair_cond)
-
+        # import ipdb; ipdb.set_trace()
         block_res_samples = ()
 
         for block in self.transformer_blocks:

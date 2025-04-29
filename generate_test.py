@@ -30,8 +30,11 @@ def taskidx_to_taskname(task_idx):
 def tensor_to_image(batch):
     batch['task_indices'] = batch['task_indices'].squeeze(0)
 
+    print("batch['images'] shape:", batch['images'].shape) # (B, 15*T, 3, 512, 512)
     batch['images'] = batch['images'].squeeze(0)
-    batch['images'] = torch.chunk(batch['images'], 2, dim=0)[0]
+    batch['images'] = torch.chunk(batch['images'], 2, dim=0)[0] # use only first 15 images (same)
+    print("batch['images'] shape:", batch['images'].shape) # (15*1, 3, 512, 512)
+
     images = []
     for i in range(batch['images'].shape[0]):
         img = batch['images'][i]
@@ -40,21 +43,22 @@ def tensor_to_image(batch):
         img = Image.fromarray(img)
         images.append(img)
     batch['images'] = images
-
-    batch['conditions'] = batch['conditions'].squeeze(0)
+    print(np.shape(batch['conditions'])) #(B, T, 15*T, 3, 512, 512)
+    batch['conditions'] = batch['conditions'].squeeze(0) #
+    print(np.shape(batch['conditions'])) #(B, T, 15*T, 3, 512, 512)
     batch['conditions'] = torch.chunk(batch['conditions'], 2, dim=0)[0]
-    import ipdb; ipdb.set_trace()
+
     conditions = []
     for t in range(batch['conditions'].shape[0]):
         task_conds = []
         for i in range(batch['conditions'].shape[1]):
             cond = batch['conditions'][t][i]
             cond = rearrange(cond, 'C H W -> H W C')
-            
-            cond = cond.byte().numpy()
+            cond = (cond*255).byte().numpy()
             cond = Image.fromarray(cond)
             task_conds.append(cond)
         conditions.append(task_conds)
+    print("Converted conditions structure:", [len(task_conds) for task_conds in conditions])
     batch['conditions'] = conditions
 
     prompts = batch['prompts']
@@ -92,21 +96,17 @@ def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=N
     
     for i, img in enumerate(sp_image):
         plt.subplot(n_row, n_col, n_col+i+2)
-        # 서포트 이미지는 이미 0~1 범위로 변환됨
         plt.imshow(img)
         plt.axis('off')
         plt.title(f"Support {i+1}")
     
-    # 3. 정답 이미지 표시
     plt.subplot(n_row, n_col, 2*n_col+1)
-    # 정답 이미지는 이미 0~1 범위로 변환됨
     plt.imshow(gt)
     plt.axis('off')
     plt.title("Ground Truth")
     
     plt.tight_layout()
     
-    # 이미지로 변환
     buf = BytesIO()
     plt.savefig(buf, format='jpg', dpi=150)
     plt.close()
@@ -118,21 +118,21 @@ def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=N
 
 
 def main():
-    # 명령줄 인자 파싱
     parser = argparse.ArgumentParser(description="Prompt Diffusion 이미지 생성기")
-    parser.add_argument("--config", type=str, required=True, help="설정 파일 경로")
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="모델 체크포인트 경로")
-    parser.add_argument("--base_model", type=str, default="stabilityai/stable-diffusion-3.5-medium", help="베이스 모델 경로 또는 이름")
-    parser.add_argument("--output_dir", type=str, default="./outputs/generated", help="출력 디렉토리")
-    parser.add_argument("--gpu", type=int, default=0, help="사용할 GPU 번호")
-    parser.add_argument("--batch_size", type=int, default=1, help="배치 크기")
-    parser.add_argument("--num_inference_steps", type=int, default=24, help="추론 스텝 수")
-    parser.add_argument("--guidance_scale", type=float, default=5.0, help="분류기 없는 가이던스 스케일 (CFG)")
-    parser.add_argument("--conditioning_scale", type=float, default=1.0, help="ControlNet 조건 스케일")
-    parser.add_argument("--max_images", type=int, default=5000, help="생성할 최대 이미지 수")
-    parser.add_argument("--seed", type=int, default=42, help="랜덤 시드")
-    parser.add_argument("--compute_fid", action="store_true", help="FID 계산용 이미지 저장 모드")
-    parser.add_argument("--coco_path", type=str, default="/data2/kietngt00/coco2017/val2017", help="COCO 데이터셋 경로")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--checkpoint_path", type=str, required=True)
+    parser.add_argument("--base_model", type=str, default="stabilityai/stable-diffusion-3.5-medium")
+    parser.add_argument("--output_dir", type=str, default="./outputs/generated")
+    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_inference_steps", type=int, default=24)
+    parser.add_argument("--guidance_scale", type=float, default=5.0)
+    parser.add_argument("--conditioning_scale", type=float, default=1.0)
+    parser.add_argument("--max_images", type=int, default=5000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--compute_fid", action="store_true")
+    parser.add_argument("--coco_path", type=str, default="/data2/david3684/ufg_diff/datasets/coco2017/val2017")
+    parser.add_argument("--black_support", action="store_true")
     args = parser.parse_args()
     
 
@@ -173,7 +173,7 @@ def main():
         tasks=test_tasks,
         res=512,
         batch_size=args.batch_size,
-        num_workers=data_config.get("num_workers", 2),
+        num_workers=data_config.get("num_workers", 0),
     )
     test_loader = coco_datamodule.test_dataloader()
     
@@ -193,7 +193,7 @@ def main():
     )
     laion_datamodule.setup()
     support_shots = data_config.get("shots", 1)
-    tuning_dl = laion_datamodule.tuning_dataloader(test_tasks, 15, 15)
+    tuning_dl = laion_datamodule.tuning_dataloader(test_tasks, num_supports=15, shots=15)
     supports = next(iter(tuning_dl))
     supports = tensor_to_image(supports) 
     
@@ -222,18 +222,16 @@ def main():
 
         gt_images = batch['images'] # List: B * T PIL 이미지
         q_cond = batch['q_cond'] # List: B * T PIL 이미지 
-        print(np.shape(gt_images), np.shape(q_cond))
         prompts = batch['prompts'] # List: B * T
         task_indices = batch['task_indices'] # List: B * T
         filenames = batch['filenames'] # List: B * T
-        
+        print(filenames[0])
         T = len(test_tasks)
         B = len(batch['q_cond']) // T
         S = support_shots
 
         sp_image = supports['images']  # S 이미지 15 * H * W * C
         sp_cond = supports['conditions']  # T [S 이미지] # B, T*15, H, W, C
-        print(np.shape(sp_image), np.shape(sp_cond))
 
         for i in range(len(q_cond)):
             if total_generated >= args.max_images:
@@ -259,23 +257,25 @@ def main():
                 
             sp_indices = np.random.choice(len(sp_image), S, replace=False)
             curr_sp_image = [sp_image[j] for j in sp_indices]
-            print(task_index_in_supports, sp_indices)
-            curr_sp_cond = [sp_cond[0][j+15*task_index_in_supports] for j in sp_indices]
-            import ipdb; ipdb.set_trace()
-            print(np.shape(curr_sp_cond))
-            # curr_sp_cond = [sp_cond[task_index_in_supports][j] for j in sp_indices]
+
+            # curr_sp_cond = [sp_cond[0][j+15*task_index_in_supports] for j in sp_indices]
+
+            curr_sp_cond = [sp_cond[task_index_in_supports][j] for j in sp_indices]
             
             query_control = torch.from_numpy(np.array(curr_q_cond)).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
             support_images = []
             support_controls = []
             
             for j in range(len(curr_sp_image)):
-                sp_img = torch.from_numpy(np.array(curr_sp_image[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
-                sp_ctrl = torch.from_numpy(np.array(curr_sp_cond[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
+                if args.black_support:
+                    sp_img = torch.zeros(1, 3, 512, 512, device=device, dtype=torch.float16)
+                    sp_ctrl = torch.zeros(1, 3, 512, 512, device=device, dtype=torch.float16)
+                else:
+                    sp_img = torch.from_numpy(np.array(curr_sp_image[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
+                    sp_ctrl = torch.from_numpy(np.array(curr_sp_cond[j])).permute(2, 0, 1).float().to(device).unsqueeze(0) / 255.0
                 support_images.append(sp_img)
                 support_controls.append(sp_ctrl)
             
-            # 이미지 생성
             with torch.no_grad():
                 for sp_idx in range(len(support_images)):
                     generated = pipe(
@@ -286,7 +286,7 @@ def main():
                         guidance_scale=args.guidance_scale,
                         negative_prompt="lowres, low quality, worst quality, blurry",
                         control_image=query_control,
-                        control_image_pair=[support_images[sp_idx], support_controls[sp_idx]],
+                        control_image_pair=[support_controls[sp_idx], support_images[sp_idx]],
                         controlnet_conditioning_scale=args.conditioning_scale,
                         num_images_per_prompt=1,
                         generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
@@ -304,15 +304,32 @@ def main():
                         vis_dir = os.path.join(output_dir, curr_task_name, "visualizations")
                         os.makedirs(vis_dir, exist_ok=True)
                         
-                        # numpy 배열로 변환 (시각화용)
+                        raw_dir = os.path.join(output_dir, curr_task_name, "raw_images")
+                        os.makedirs(raw_dir, exist_ok=True)
+                        
+                        
+                        filename_suffix = "_black" if args.black_support else ""
+                        raw_save_path = os.path.join(
+                            raw_dir, f"{os.path.splitext(curr_filename)[0]}{filename_suffix}_sp{sp_idx}.png"
+                        )
+                        generated_image.save(raw_save_path)
+                        
                         query_control_np = query_control[0].permute(1, 2, 0).cpu().numpy()
-                        support_control_np = support_controls[sp_idx][0].permute(1, 2, 0).cpu().numpy()
-                        support_gt_np = support_images[sp_idx][0].permute(1, 2, 0).cpu().numpy()
+                        
+                        if args.black_support:
+                            support_control_np = np.zeros((512, 512, 3))
+                            support_gt_np = np.zeros((512, 512, 3))
+                        else:
+                            support_control_np = support_controls[sp_idx][0].permute(1, 2, 0).cpu().numpy()
+                            support_gt_np = support_images[sp_idx][0].permute(1, 2, 0).cpu().numpy()
+                        
                         gt_img_np = np.array(curr_gt_image).astype(np.float32) / 255.0
                         
+                        filename_suffix = "black_sp" if args.black_support else "sp"
                         vis_save_path = os.path.join(
-                            vis_dir, f"{os.path.splitext(curr_filename)[0]}_sp{sp_idx}.jpg"
+                            vis_dir, f"{os.path.splitext(curr_filename)[0]}_{filename_suffix}{sp_idx}.jpg"
                         )
+                        print(f"Saving visualization to {vis_save_path}")   
                         
                         plot = visualize_generation(
                             gt=gt_img_np,
