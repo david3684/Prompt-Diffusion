@@ -12,14 +12,12 @@ import os
 import torchvision.transforms as T
 
 TASKS = {
-    "hed": 0,
+    "canny": 0,
     "depth": 1,
-    "normal": 2,
-    "canny": 3,
-    "mlsd": 4,
-    "seg": 5,
-    "densepose": 6, # representing segmentation task
-    "pose": 7,
+    "hed": 2,
+    "normal": 3,
+    "pose": 4, # representing segmentation task
+    "densepose": 5,
 }
 
 
@@ -34,6 +32,7 @@ class LaionBaseDataset(Dataset):
         indices: list = None,
         train: bool = True,
         shuffle: bool = True,
+        task_map: dict = None,
     ):
         """
         Args:
@@ -52,7 +51,7 @@ class LaionBaseDataset(Dataset):
         self.shots = shots
         self.train = train
         self.shuffle = shuffle
-
+        self.task_map = task_map 
         self.transform = T.Compose([
             T.Resize((res, res)),
             T.ToTensor(),
@@ -123,7 +122,7 @@ class LaionBaseDataset(Dataset):
             tasks = np.random.choice(self.tasks, self.tasks_per_batch, replace=replace)
         else:
             tasks = self.tasks
-        task_indices = torch.tensor([TASKS[t] for t in tasks]) # [T]
+        task_indices = torch.tensor([self.task_map[t] for t in tasks]) # [T]
 
         # load conditions - keep these normalized to 0~1
         labels = []
@@ -207,7 +206,9 @@ class ControlDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.current_train_batch_index = 0  # Track batch index
-
+        
+        all_tasks = list(dict.fromkeys(train_tasks + test_tasks))  # 중복 제거 및 순서 유지
+        self.task_map = {task: idx for idx, task in enumerate(all_tasks)}
     def setup(self, stage=None):
         generator = torch.Generator().manual_seed(1505)
 
@@ -219,6 +220,7 @@ class ControlDataModule(L.LightningDataModule):
             train_indices, val_indices = torch.utils.data.random_split( # Need to split the indices to maintain the random task selection in getitem
                 torch.arange(total_samples), self.splits, generator=generator
             )
+            print(len(train_indices))
             train_human_ds = LaionBaseDataset(
                 path=self.human_path,
                 tasks=['pose', 'densepose'],
@@ -226,17 +228,18 @@ class ControlDataModule(L.LightningDataModule):
                 shots=self.shots,
                 res=self.res,
                 indices=train_indices,
-                train=True
+                train=True,
+                task_map = self.task_map,
             )
-            val_human_ds = LaionBaseDataset(
-                path=self.human_path,
-                tasks=['pose', 'densepose'],
-                tasks_per_batch=self.tasks_per_batch,
-                shots=self.shots,
-                res=self.res,
-                indices=val_indices,
-                train=False
-            )
+            # val_human_ds = LaionBaseDataset(
+            #     path=self.human_path,
+            #     tasks=['pose', 'densepose'],
+            #     tasks_per_batch=self.tasks_per_batch,
+            #     shots=self.shots,
+            #     res=self.res,
+            #     indices=val_indices,
+            #     train=False
+            # )
 
         # Init 2nd Dataset
         total_samples = min(len(glob(self.path + '/*/*.jpg')), self.total_samples)
@@ -244,6 +247,7 @@ class ControlDataModule(L.LightningDataModule):
         train_indices, val_indices = torch.utils.data.random_split( # Need to split the indices to maintain the random task selection in getitem
             torch.arange(total_samples), self.splits, generator=generator
         )
+        print(len(train_indices))
         train_tasks = self.train_tasks.copy()
         if check_human_tasks:
             train_tasks.remove('pose')
@@ -255,26 +259,27 @@ class ControlDataModule(L.LightningDataModule):
             shots=self.shots,
             res=self.res,
             indices=train_indices,
-            train=True
+            train=True,
+            task_map = self.task_map,
         )
-        val_normal_ds = LaionBaseDataset(
-            path=self.path,
-            tasks=train_tasks,
-            tasks_per_batch=self.tasks_per_batch,
-            shots=self.shots,
-            res=self.res,
-            indices=val_indices,
-            train=False
-        )
+        # val_normal_ds = LaionBaseDataset(
+        #     path=self.path,
+        #     tasks=train_tasks,
+        #     tasks_per_batch=self.tasks_per_batch,
+        #     shots=self.shots,
+        #     res=self.res,
+        #     indices=val_indices,
+        #     train=False
+        # )
 
         # Init Combined Dataset
         if check_human_tasks:
             self.train_ds = CombineDatasets([train_normal_ds, train_human_ds], shuffle=True)
-            self.val_ds = CombineDatasets([val_normal_ds, val_human_ds])
+            # self.val_ds = CombineDatasets([val_normal_ds, val_human_ds])
         else:
             # If no human dataset, just use the normal dataset
             self.train_ds = train_normal_ds
-            self.val_ds = val_normal_ds
+            # self.val_ds = val_normal_ds
 
         
     def train_dataloader(self):
@@ -313,6 +318,7 @@ class ControlDataModule(L.LightningDataModule):
             indices=indices,
             train=False,
             shuffle=False, # Fix support set for inference visualization, the data is shuffle in training code
+            task_map = self.task_map,
         )
 
         return DataLoader(

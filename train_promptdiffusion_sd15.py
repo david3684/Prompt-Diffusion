@@ -114,7 +114,9 @@ def log_generated_images(
     query_cond = conds[0, 0, 0]  # [C, H, W]
     support_cond = conds[0, 0, 1]  # [C, H, W]
     prompt = prompts[0][0]  # Single prompt
-    task = args.train_tasks[task_indices[0][0].item()]  # Single task
+    task_idx = task_indices[0][0].item()
+    
+    task = args.train_tasks[task_idx]  # Single task
 
     def tensor_to_pil(tensor):
         tensor = tensor.cpu().permute(1, 2, 0).float().numpy()  # [H, W, C]
@@ -902,7 +904,7 @@ def main(args):
         train_tasks=args.train_tasks, 
         test_tasks=[], 
         tasks_per_batch=args.tasks_per_batch,
-        splits=(0.9, 0.1),
+        splits=(1.0, 0.0),
         res=args.resolution,
         shots=1,
         batch_size=args.train_batch_size,
@@ -1166,7 +1168,10 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
-
+        if accelerator.is_main_process:
+            save_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch}")
+            accelerator.save_state(save_path)
+            logger.info(f"Saved state to {save_path}")
     # Create the pipeline using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
