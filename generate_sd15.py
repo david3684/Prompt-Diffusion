@@ -117,21 +117,15 @@ def main():
     # 랜덤 시드 설정
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+
+
     
-    # 설정 파일 로드
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
-    
-    data_config = config.get("data", {})
-    
-    # 디바이스 설정
     device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # 모델 로드
     print(f"Loading model from {args.checkpoint_path}...")
     controlnet = PromptDiffusionControlNetModel.from_pretrained(
-        args.checkpoint_path, torch_dtype=torch.float16
+        args.checkpoint_path
     )
     
     print(f"Loading base model from {args.base_model}...")
@@ -140,39 +134,22 @@ def main():
     )
     pipe.to(device, torch.float16)
     
-    # 태스크 필터링 (특정 태스크만 사용할 경우)
-    train_tasks = data_config.get("train_tasks", ["canny", "depth", "hed", "normal"])
-    if args.task:
-        if args.task not in train_tasks:
-            print(f"Warning: {args.task} is not in train_tasks. Adding it.")
-            train_tasks.append(args.task)
-        # 특정 태스크만 사용
-        train_tasks = [args.task]
     
-    # 데이터 모듈 초기화
     print("Setting up data module...")
-    datamodule = ControlDataModule(
-        path=data_config.get("path", "/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman"),
-        human_path=data_config.get("human_path", "/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_human"),
-        train_tasks=train_tasks,
-        test_tasks=data_config.get("test_tasks", []),
-        tasks_per_batch=1 if args.task else data_config.get("tasks_per_batch", 1),
-        splits=(0.9, 0.1),
+    laion_datamodule = ControlDataModule(
+        path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman",
+        human_path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_human",
+        train_tasks=args.task,
+        test_tasks=[],
+        tasks_per_batch=1 
+        splits=(1.0, 0.0),
         res=512,
-        shots=data_config.get("shots", 1),
+        shots=1,
         batch_size=args.batch_size,
-        num_workers=data_config.get("num_workers", 2),
-        total_samples=data_config.get("total_samples", 10000),
+        num_workers=4,
+        total_samples=5000,
     )
-    datamodule.setup()
-    
-    # 테스트 데이터셋 준비
-    if args.compute_fid:
-        test_ds = datamodule.val_ds
-    else:
-        # 적은 수의 샘플로 테스트
-        indices = list(range(min(100, len(datamodule.val_ds))))
-        test_ds = torch.utils.data.Subset(datamodule.val_ds, indices)
+    laion_datamodule.setup()
     
     test_loader = DataLoader(
         test_ds,

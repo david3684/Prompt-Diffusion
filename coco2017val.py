@@ -5,7 +5,7 @@ from torch.utils.data import Dataset, DataLoader
 import lightning as L
 from glob import glob
 from laion_meta_dataset import TASKS
-
+import torchvision.transforms as T
 
 class COCOValDataset(Dataset):
     def __init__(
@@ -27,6 +27,16 @@ class COCOValDataset(Dataset):
         else:
             filenames = glob(self.path + "/images/*.jpg")
         self.filenames = filenames
+        self.transform = T.Compose([
+            T.Resize((self.resolution, self.resolution)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        
+        self.condition_transform = T.Compose([
+            T.Resize((self.resolution, self.resolution)),
+            T.ToTensor()
+        ])
 
     def __len__(self) -> int:
         return len(self.filenames)
@@ -35,7 +45,8 @@ class COCOValDataset(Dataset):
         path = self.filenames[i]
         name = path.split('/')[-1]
 
-        image = Image.open(self.path + f'/images/{name}').convert('RGB').resize((self.res, self.res))
+        image = Image.open(self.path + f'/images/{name}').convert('RGB')
+        image = self.transform(image)
         q_cond = []
         task_indices = []
         prompts = []
@@ -43,7 +54,7 @@ class COCOValDataset(Dataset):
         images = []
         for task in self.tasks:
             path = self.path + f"/{task}/{name}"
-            q_cond.append(Image.open(path).convert('RGB').resize((self.res, self.res)))
+            q_cond.append(self.condition_transform(Image.open(path).convert('RGB')))
             task_indices.append(TASKS[task])
             with open(self.path + f"/prompts/{name.replace('.jpg', '.txt')}") as fp:
                 prompt = fp.read().strip()

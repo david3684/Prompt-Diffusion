@@ -300,30 +300,28 @@ class ControlDataModule(L.LightningDataModule):
 
 
     def tuning_dataloader(
-            self, 
-            tasks: Union[str, list[str]], 
-            num_supports: int = 8,
-            shots: int = 4,):
-        
-        indices = range(int(self.total_samples//2) + 1, int(self.total_samples//2) + 1 + num_supports)
+            self,
+            tasks: Union[str, list[str]],
+            num_supports: int = 15,
+            shots: int = 1,):
+        indices = range(int(self.total_samples//2) + 15+ 24, int(self.total_samples//2) + 15 + 24 + num_supports)
         if isinstance(tasks, str):
             tasks = [tasks]
         human_task = 'pose' in tasks or 'densepose' in tasks
         self.tuning_ds = LaionBaseDataset(
             path=self.human_path if human_task else self.path,
             tasks=tasks,
-            tasks_per_batch=len(tasks),
+            tasks_per_batch=1,
             shots=shots,
             res=self.res,
             indices=indices,
             train=False,
-            shuffle=False, # Fix support set for inference visualization, the data is shuffle in training code
             task_map = self.task_map,
+            shuffle=False, # Fix support set for inference visualization, the data is shuffle in training code
         )
-
         return DataLoader(
-            self.tuning_ds, 
-            batch_size=1, 
-            num_workers=0,
+            self.tuning_ds,
+            batch_size=1,
+            num_workers=4,
         )
 
