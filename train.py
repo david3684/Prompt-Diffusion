@@ -12,7 +12,7 @@ from cldm.model import create_model, load_state_dict
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
-
+from pytorch_lightning.loggers import WandbLogger
 
 def get_parser(**parser_kwargs):
 
@@ -81,7 +81,7 @@ def get_parser(**parser_kwargs):
         "--data_config",
         type=str,
         help="path to data config files",
-        default='./models/data.yaml',
+        default='./models/dataset.yaml',
     )
     parser.add_argument(
         "--sd_v2",
@@ -249,9 +249,15 @@ if __name__ == "__main__":
 
     # Trainer
     tb_logger = pl.loggers.TensorBoardLogger(save_dir=logdir)
-    trainer = pl.Trainer(gpus=opt.gpus, accelerator='ddp', num_nodes=opt.nnode,
+    logger = WandbLogger(
+        project="Uni-ControlNet",
+        name="local_v15_t4",
+        save_dir=logdir,
+        log_model=False,
+    )
+    trainer = pl.Trainer(accelerator='gpu',
                          max_steps=10000, check_val_every_n_epoch=2, accumulate_grad_batches=4,
-                         precision=32, callbacks=callbacks, logger=tb_logger)
+                         precision=32, callbacks=callbacks, logger=tb_logger, strategy='ddp_find_unused_parameters_true')
 
     # Train!
     trainer.fit(model, dataloader)

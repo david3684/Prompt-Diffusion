@@ -80,9 +80,8 @@ def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=N
 
 def main():
     parser = argparse.ArgumentParser(description="Prompt Diffusion 이미지 생성기")
-    parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint_path", type=str, required=True)
-    parser.add_argument("--base_model", type=str, default="stabilityai/stable-diffusion-3.5-medium")
+    parser.add_argument("--base_model", type=str, default="stable-diffusion-v1-5/stable-diffusion-v1-5")
     parser.add_argument("--output_dir", type=str, default="./outputs/generated")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--gen_batch_size", type=int, default=1)
@@ -115,7 +114,7 @@ def main():
     )
     pipe.to(device, torch.float16)
 
-    tasks = ['pose', 'densepose']
+    tasks = ['canny']
     
     print(f"Using test tasks: {tasks}")
     
@@ -124,7 +123,7 @@ def main():
         path=args.coco_path,
         tasks=tasks,
         res=512,
-        batch_size=args.batch_size,
+        batch_size=args.gen_batch_size,
         num_workers=4,
     )
     test_loader = coco_datamodule.test_dataloader()

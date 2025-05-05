@@ -813,7 +813,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = PromptDiffusionControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -993,7 +993,7 @@ def main(args):
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = [d for d in dirs if d.startswith("checkpoint-") and d[len("checkpoint-"):].isdigit()]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
 
@@ -1177,36 +1177,6 @@ def main(args):
     if accelerator.is_main_process:
         controlnet = unwrap_model(controlnet)
         controlnet.save_pretrained(args.output_dir)
-
-        # Run a final round of validation.
-        image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
-                vae=vae,
-                text_encoder=text_encoder,
-                tokenizer=tokenizer,
-                unet=unet,
-                controlnet=None,
-                args=args,
-                accelerator=accelerator,
-                weight_dtype=weight_dtype,
-                step=global_step,
-                is_final_validation=True,
-            )
-
-        if args.push_to_hub:
-            save_model_card(
-                repo_id,
-                image_logs=image_logs,
-                base_model=args.pretrained_model_name_or_path,
-                repo_folder=args.output_dir,
-            )
-            upload_folder(
-                repo_id=repo_id,
-                folder_path=args.output_dir,
-                commit_message="End of training",
-                ignore_patterns=["step_*", "epoch_*"],
-            )
 
     accelerator.end_training()
 

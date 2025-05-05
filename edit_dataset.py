@@ -12,7 +12,7 @@ import torch
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.utils.data import Dataset
-
+import torchvision.transforms as T
 
 TASK_MAPPING = {
     'pose': 'human',
@@ -38,7 +38,7 @@ class EditDataset(Dataset):
         max_samples_per_task: int = 150000, 
     ):
         assert split in ("train", "val")  
-        assert sum(splits) == 1
+        # assert sum(splits) == 1
         self.path = path
         self.min_resize_res = min_resize_res
         self.max_resize_res = max_resize_res
@@ -48,7 +48,19 @@ class EditDataset(Dataset):
         self.max_samples_per_task = max_samples_per_task
         self.prompt_option = prompt_option
         self.split = split
+        # import ipdb; ipdb.set_trace()
         train_ratio, val_ratio = splits
+        
+        self.transform = T.Compose([
+            T.Resize((512, 512)),
+            T.ToTensor(),
+            T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        self.condition_transform = T.Compose([
+            T.Resize((512, 512)),
+            T.ToTensor()
+        ])
         
         self.file_mapping = {task: [] for task in task_list}
         
@@ -120,11 +132,13 @@ class EditDataset(Dataset):
         support_filename = support_data['filename']
         control_support_path = os.path.join(base_path, dir_name, task, support_filename)
         
-        image_q = Image.open(gt_path).convert('RGB')        
-        image_q = 2 * torch.tensor(np.array(image_q)).float() / 255. - 1  
+        image_q = Image.open(gt_path).convert('RGB')   
+        image_q = self.transform(image_q)     
+        # image_q = 2 * torch.tensor(np.array(image_q)).float() / 255. - 1  
         
         image_sp = Image.open(support_file).convert('RGB')
-        image_sp = 2 * torch.tensor(np.array(image_sp)).float() / 255. - 1  # [-1, 1] 
+        image_sp = self.transform(image_q)     
+        # image_sp = 2 * torch.tensor(np.array(image_sp)).float() / 255. - 1  # [-1, 1] 
         
         with open(txt_path, 'r') as f:
             prompt = f.read().strip()
@@ -132,10 +146,12 @@ class EditDataset(Dataset):
         txt_log = task
         
         control_q = Image.open(control_query_path).convert('RGB')
-        control_q = torch.tensor(np.array(control_q)).float() / 255.0  # [0, 1] 
+        control_q = self.condition_transform(control_q)
+        # control_q = torch.tensor(np.array(control_q)).float() / 255.0  # [0, 1] 
             
         control_sp = Image.open(control_support_path).convert('RGB')
-        control_sp = torch.tensor(np.array(control_sp)).float() / 255.0  # [0, 1] 
+        control_sp = self.condition_transform(control_sp)
+        # control_sp = torch.tensor(np.array(control_sp)).float() / 255.0  # [0, 1] 
         
         # example_pair 
         example_pair = torch.cat((control_sp, image_sp), dim=2)  # h w c

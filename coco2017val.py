@@ -28,13 +28,13 @@ class COCOValDataset(Dataset):
             filenames = glob(self.path + "/images/*.jpg")
         self.filenames = filenames
         self.transform = T.Compose([
-            T.Resize((self.resolution, self.resolution)),
+            T.Resize((self.res, self.res)),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
         
         self.condition_transform = T.Compose([
-            T.Resize((self.resolution, self.resolution)),
+            T.Resize((self.res, self.res)),
             T.ToTensor()
         ])
 

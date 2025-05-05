@@ -6,10 +6,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 sd15_pd/
-
+logs/
 # C extensions
 *.so
-
+models/
 outputs/
 wandb/
 # Distribution / packaging
