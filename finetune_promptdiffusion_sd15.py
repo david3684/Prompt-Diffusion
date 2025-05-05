@@ -76,6 +76,143 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
 
+def log_generated_images(
+    vae, text_encoder, tokenizer, unet, controlnet, pipeline_cls, args, accelerator, weight_dtype, step, batch
+):
+    logger.info("Running image generation for logging...")
+
+    # Unwrap controlnet
+    controlnet = accelerator.unwrap_model(controlnet)
+    if is_compiled_module(controlnet):
+        controlnet = controlnet._orig_mod
+
+    # Initialize pipeline
+    pipeline = PromptDiffusionPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        controlnet=controlnet,
+        scheduler=UniPCMultistepScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler"
+        ),
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    imgs = batch["images"]  # [B, 2, C, H, W]
+    conds = batch["conditions"]  # [B, T, 2, C, H, W]
+    prompts = batch["prompts"]  # List of strings: [gt_prompt, support_prompt]
+    task_indices = batch["task_indices"]  # [T]
+
+    # Use only the first sample (b=0) and first task (t=0)
+    gt_img = imgs[0, 0]  # [C, H, W]
+    support_img = imgs[0, 1]  # [C, H, W]
+    query_cond = conds[0, 0, 0]  # [C, H, W]
+    support_cond = conds[0, 0, 1]  # [C, H, W]
+    prompt = prompts[0][0]  # Single prompt
+    task_idx = task_indices[0][0].item()
+    
+    task = args.train_tasks[task_idx]  # Single task
+
+    def tensor_to_pil(tensor, is_condition=False):
+        tensor = tensor.cpu().permute(1, 2, 0).float().numpy()  # [H, W, C]
+        if is_condition:
+            tensor = tensor.clip(0, 1) * 255
+        else:
+            tensor = (tensor * 0.5 + 0.5).clip(0, 1) * 255
+        tensor = tensor.astype(np.uint8)
+        return Image.fromarray(tensor)
+
+    gt_pil = tensor_to_pil(gt_img, is_condition=False)
+    support_pil = tensor_to_pil(support_img, is_condition=False)
+    query_cond_pil = tensor_to_pil(query_cond, is_condition=True)
+    support_cond_pil = tensor_to_pil(support_cond, is_condition=True)
+
+    image = query_cond_pil
+    image_pair = [support_cond_pil, support_pil]
+    
+    # Generate a single image
+    generated_images = []
+    with torch.autocast("cuda"):
+        output = pipeline(
+            prompt=prompt,
+            image=image,
+            image_pair=image_pair,
+            num_inference_steps=24,
+            guidance_scale=5.0,
+            negative_prompt='lowres, low quality, worst quality',
+            generator=torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None,
+            output_type="pil",
+        )
+        generated_image = output.images[0]
+        generated_images.append(generated_image)
+
+    # Log images
+    image_logs = [{
+        "gt_image": gt_pil,
+        "generated_images": generated_images,
+        "query_cond": query_cond_pil,
+        "support_image": support_pil,
+        "support_cond": support_cond_pil,
+        "prompt": prompt,
+        "task": task
+    }]
+
+    # Log to trackers
+    for tracker in accelerator.trackers:
+        if tracker.name == "tensorboard":
+            for log in image_logs:
+                gt_image = log["gt_image"]
+                query_cond = log["query_cond"]
+                support_cond = log["support_cond"]
+                support_image = log["support_image"]
+                generated_images = log["generated_images"]
+                prompt = log["prompt"]
+                task = log["task"]
+
+                formatted_images = [
+                    np.asarray(gt_image),
+                    np.asarray(query_cond),
+                    np.asarray(support_cond),
+                    np.asarray(support_image)
+                ] + [np.asarray(img) for img in generated_images]
+                formatted_images = np.stack(formatted_images)
+
+                tracker.writer.add_images(
+                    f"{task}/{prompt[:50]}", formatted_images, step, dataformats="NHWC"
+                )
+        elif tracker.name == "wandb":
+            for log in image_logs:
+                gt_image = log["gt_image"]
+                query_cond = log["query_cond"]
+                support_cond = log["support_cond"]
+                support_image = log["support_image"]
+                generated_images = log["generated_images"]
+                prompt = log["prompt"]
+                task = log["task"]
+
+                wandb_images = [
+                    wandb.Image(gt_image, caption="Ground Truth"),
+                    wandb.Image(query_cond, caption="Query Condition"),
+                    wandb.Image(support_cond, caption="Support Condition"),
+                    wandb.Image(support_image, caption="Support Image")
+                ] + [wandb.Image(img, caption=f"Generated: {prompt}") for img in generated_images]
+                tracker.log({
+                    f"validation/{task}/images": wandb_images,
+                    f"validation/{task}/prompt": prompt
+                })
+        else:
+            logger.warning(f"Image logging not implemented for {tracker.name}")
+
+    # Cleanup
+    del pipeline
+    torch.cuda.empty_cache()
+    return image_logs
+
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path,
@@ -246,7 +383,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=0,
+        default=4,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -826,6 +963,21 @@ def main(args):
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     accelerator.save_state(save_path)
                     logger.info(f"Saved state to {save_path}")
+              
+            if global_step % args.validation_steps == 0:      
+                log_generated_images(
+                            vae=vae,
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            unet=unet,
+                            controlnet=controlnet,
+                            pipeline_cls=PromptDiffusionPipeline,
+                            args=args,
+                            accelerator=accelerator,
+                            weight_dtype=weight_dtype,
+                            step=global_step,
+                            batch=batch,
+                        )
 
         logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
         progress_bar.set_postfix(**logs)

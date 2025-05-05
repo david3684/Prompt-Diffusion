@@ -118,15 +118,19 @@ def log_generated_images(
     
     task = args.train_tasks[task_idx]  # Single task
 
-    def tensor_to_pil(tensor):
+    def tensor_to_pil(tensor, is_condition=False):
         tensor = tensor.cpu().permute(1, 2, 0).float().numpy()  # [H, W, C]
-        tensor = (tensor * 255).clip(0, 255).astype(np.uint8)
+        if is_condition:
+            tensor = tensor.clip(0, 1) * 255
+        else:
+            tensor = (tensor * 0.5 + 0.5).clip(0, 1) * 255
+        tensor = tensor.astype(np.uint8)
         return Image.fromarray(tensor)
 
-    gt_pil = tensor_to_pil(gt_img)
-    support_pil = tensor_to_pil(support_img)
-    query_cond_pil = tensor_to_pil(query_cond)
-    support_cond_pil = tensor_to_pil(support_cond)
+    gt_pil = tensor_to_pil(gt_img, is_condition=False)
+    support_pil = tensor_to_pil(support_img, is_condition=False)
+    query_cond_pil = tensor_to_pil(query_cond, is_condition=True)
+    support_cond_pil = tensor_to_pil(support_cond, is_condition=True)
 
     image = query_cond_pil
     image_pair = [support_cond_pil, support_pil]

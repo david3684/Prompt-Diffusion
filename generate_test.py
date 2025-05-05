@@ -50,8 +50,7 @@ def visualize_generation(gt, cond, image, sp_cond, sp_image, prompt, task_name=N
         plt.title(f"Support {i+1}")
     
     plt.subplot(n_row, n_col, n_col+1)
-    image_np = np.array(image).astype(np.float32) / 255.0
-    plt.imshow(np.clip(image_np, 0, 1))
+    plt.imshow(image)  # PIL 이미지를 직접 사용
     plt.axis('off')
     plt.title("Generated")
     
@@ -83,6 +82,7 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--base_model", type=str, default="stable-diffusion-v1-5/stable-diffusion-v1-5")
     parser.add_argument("--output_dir", type=str, default="./outputs/generated")
+    parser.add_argument("--tasks", nargs='+', default=["depth"])
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--gen_batch_size", type=int, default=1)
     parser.add_argument("--num_inference_steps", type=int, default=24)
@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--max_images", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compute_fid", action="store_true")
-    parser.add_argument("--coco_path", type=str, default="/data2/david3684/ufg_diff/datasets/coco2017/val2017")
+    parser.add_argument("--coco_path", type=str, default="/data2/david3684/ufg_diff/sd3control_base/datasets/coco2017/val2017")
     parser.add_argument("--black_support", action="store_true")
     args = parser.parse_args()
     
@@ -110,11 +110,11 @@ def main():
     
     print(f"Loading base model from {args.base_model}...")
     pipe = PromptDiffusionPipeline.from_pretrained(
-        args.base_model, controlnet=controlnet
+        args.base_model, controlnet=controlnet, saftey_checker=None,
     )
     pipe.to(device, torch.float16)
 
-    tasks = ['canny']
+    tasks = args.tasks
     
     print(f"Using test tasks: {tasks}")
     
@@ -130,8 +130,8 @@ def main():
     
     print("Loading LAION support dataset...")
     laion_datamodule = ControlDataModule(
-        path="/data2/david3684/ufg_diff/datasets/laion_data/laion_nonhuman",
-        human_path="/data2/david3684/ufg_diff/datasets/laion_data/laion_human",
+        path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_nonhuman",
+        human_path="/data2/david3684/ufg_diff/sd3control_base/datasets/laion_data/laion_human",
         train_tasks=tasks,
         test_tasks=tasks,
         tasks_per_batch=1,
@@ -143,7 +143,7 @@ def main():
         total_samples=150000,
     )
     laion_datamodule.setup()
-    tuning_dl = laion_datamodule.tuning_dataloader(args.task, num_supports=15, shots=1)
+    tuning_dl = laion_datamodule.tuning_dataloader(args.tasks, num_supports=15, shots=1)
     supports = next(iter(tuning_dl))
     
     
@@ -152,7 +152,7 @@ def main():
     if "." in ckpt_name:
         ckpt_name = ckpt_name.split(".")[0]
     
-    output_dir = os.path.join(args.output_dir, model_name, ckpt_name)
+    output_dir = os.path.join(args.output_dir, model_name)
     os.makedirs(output_dir, exist_ok=True)
     
     for task in tasks:
@@ -199,9 +199,10 @@ def main():
                 image_pair=[sp_cond, sp_img],
                 guidance_scale=args.guidance_scale,
                 num_inference_steps=args.num_inference_steps,
-                negative_prompt="lowres, low quality, worst quality",
+                negative_prompt=["lowres, low quality, worst quality" for _ in range(batch_size)],
                 controlnet_conditioning_scale=args.conditioning_scale,
                 generator=torch.Generator(device=device).manual_seed(args.seed + total_generated),
+                output_type="pil"
             )
             
             # 생성된 이미지
@@ -214,21 +215,19 @@ def main():
             task_dir = os.path.join(output_dir, curr_task_name)
             
             # Convert tensors to Numpy for visualization
+            # Convert tensors to Numpy for visualization
             gt_img_np = gt_images[i].cpu().float().permute(1, 2, 0).numpy()  # Shape: (H, W, C)
-            gt_img_np = (gt_img_np * 255.0).astype(np.uint8)  # [0, 1] -> [0, 255]
+            gt_img_np = (gt_img_np * 255.0).clip(0, 255).astype(np.uint8)  # [0, 1] -> [0, 255]
             query_control_np = q_cond[i].cpu().float().permute(1, 2, 0).numpy()  # Shape: (H, W, C)
-            query_control_np = (query_control_np * 255.0).astype(np.uint8)  # [0, 1] -> [0, 255]
-            generated_image = generated.images[i]  # PIL (pipe 출력)
-            
-            # Convert support tensors to Numpy for visualization
+            query_control_np = (query_control_np * 255.0).clip(0, 255).astype(np.uint8)  # [0, 1] -> [0, 255]
             support_control_np = sp_cond[0].cpu().float().permute(1, 2, 0).numpy()  # Shape: (H, W, C)
-            support_control_np = (support_control_np * 255.0).astype(np.uint8)  # [0, 1] -> [0, 255]
+            support_control_np = (support_control_np * 255.0).clip(0, 255).astype(np.uint8)  # [0, 1] -> [0, 255]
             support_gt_np = sp_img[0].cpu().float().permute(1, 2, 0).numpy()  # Shape: (H, W, C)
-            support_gt_np = (support_gt_np * 255.0).astype(np.uint8)  # [0, 1] -> [0, 255]
+            support_gt_np = (support_gt_np * 255.0).clip(0, 255).astype(np.uint8)  # [0, 1] -> [0, 255]
             curr_prompt = prompts[i]
             
             # Save visualization
-            vis_save_path = os.path.join(task_dir, "visualizations", f"{filenames[i]}_vis.jpg")
+            vis_save_path = os.path.join(task_dir, "visualizations", f"{filenames[i]}")
             print(f"Saving visualization to {vis_save_path}")            
                         
             plot = visualize_generation(
@@ -238,16 +237,17 @@ def main():
                 sp_cond=[support_control_np],
                 sp_image=[support_gt_np],
                 prompt=curr_prompt,
-                task_name=curr_task_name
+                task_name=curr_task_name,
+                
             )
             plot.save(vis_save_path)
                     
-            raw_save_path = os.path.join(task_dir, "raw_images", f"{filenames[i]}_gen.jpg")
+            raw_save_path = os.path.join(task_dir, "raw_images", f"{filenames[i]}")
             generated_image.save(raw_save_path)
             
             # Save for FID if required
             if args.compute_fid:
-                fid_save_path = os.path.join(task_dir, "fid", f"{filenames[i]}_fid.jpg")
+                fid_save_path = os.path.join(task_dir, "fid", f"{filenames[i]}")
                 generated_image.save(fid_save_path)
             
             total_generated += 1

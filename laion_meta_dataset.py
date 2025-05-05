@@ -317,7 +317,7 @@ class ControlDataModule(L.LightningDataModule):
             indices=indices,
             train=False,
             task_map = self.task_map,
-            shuffle=False, # Fix support set for inference visualization, the data is shuffle in training code
+            shuffle=True, # Fix support set for inference visualization, the data is shuffle in training code
         )
         return DataLoader(
             self.tuning_ds,

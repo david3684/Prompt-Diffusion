@@ -1295,7 +1295,7 @@ class PromptDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
             self.unet.to("cpu")
             self.controlnet.to("cpu")
             torch.cuda.empty_cache()
-
+        self.safety_checker = None
         if not output_type == "latent":
             image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False, generator=generator)[
                 0
@@ -1304,7 +1304,7 @@ class PromptDiffusionPipeline(DiffusionPipeline, TextualInversionLoaderMixin, Lo
         else:
             image = latents
             has_nsfw_concept = None
-
+        has_nsfw_concept = None
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
         else:

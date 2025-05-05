@@ -26,6 +26,7 @@ class COCOValDataset(Dataset):
             filenames = glob(self.path + "/pose/*.jpg")
         else:
             filenames = glob(self.path + "/images/*.jpg")
+        filenames = sorted(filenames)
         self.filenames = filenames
         self.transform = T.Compose([
             T.Resize((self.res, self.res)),
