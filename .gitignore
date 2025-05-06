@@ -6,6 +6,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 sd15_pd/
+sd15_pd_re/
 logs/
 # C extensions
 *.so
